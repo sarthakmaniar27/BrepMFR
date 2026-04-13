@@ -55,8 +55,7 @@ class DomainAdversarialLoss(nn.Module):
         >>> output = loss(f_s, f_t, w_s, w_t)
     """
 
-    def __init__(self, domain_discriminator: nn.Module, reduction: Optional[str] = 'mean',
-                 grl: Optional = None):
+    def __init__(self, domain_discriminator: nn.Module, reduction: Optional[str] = 'mean', grl: Optional = None):
         super(DomainAdversarialLoss, self).__init__()
         self.grl = WarmStartGradientReverseLayer(alpha=1., lo=0., hi=1., max_iters=1000, auto_step=True) if grl is None else grl
         self.domain_discriminator = domain_discriminator

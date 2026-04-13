@@ -13,15 +13,18 @@ from models.modules.utils.macro import *
 
 torch.backends.cudnn.enabled = True
 torch.backends.cudnn.benchmark = True
-# import os
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+# os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # Use all available GPUs. Set to "0" to use only the first GPU, "1" for the second, etc.
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+print(f"Using device: {device}")
 
 parser = argparse.ArgumentParser("BrepMFR Network model")
 parser.add_argument("traintest", choices=("train", "test"), help="Whether to train or test")
 parser.add_argument("--num_classes", type=int, default=25, help="Number of features")
 parser.add_argument("--dataset", choices=("cadsynth", "transfer"), default="cadsynth", help="Dataset to train on")
 parser.add_argument("--dataset_path", type=str, help="Path to dataset")
-parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
 parser.add_argument(
     "--num_workers",
     type=int,
@@ -41,6 +44,22 @@ parser.add_argument(
     help="Experiment name (used to create folder inside ./results/ to save logs and checkpoints)",
 )
 
+# Optional argument to load weights from a checkpoint for fine-tuning. 
+# If provided, the model will be initialized with the weights from the checkpoint and training will continue from there. If not provided, training will start from scratch.
+parser.add_argument(
+    "--pre_train",
+    type=str,
+    default=None,
+    help="Checkpoint file to load weights from for fine-tuning",
+)
+
+# parser.add_argument(
+#     "--device",
+#     type=str,
+#     default="gpu",
+#     help="Device to run on (default: gpu)",
+# )
+
 #设置transformer模块的默认参数
 parser.add_argument("--dropout", type=float, default=0.3)
 parser.add_argument("--attention_dropout", type=float, default=0.3)
@@ -49,6 +68,7 @@ parser.add_argument("--d_model", type=int, default=512)
 parser.add_argument("--dim_node", type=int, default=256)
 parser.add_argument("--n_heads", type=int, default=32)
 parser.add_argument("--n_layers_encode", type=int, default=8)
+parser.add_argument("--warmup_freeze_epochs", type=int, default=3)
 
 parser = Trainer.add_argparse_args(parser)
 args = parser.parse_args()
@@ -104,6 +124,11 @@ results/{args.experiment_name}/{month_day}/{hour_min_second}/best.ckpt
 -----------------------------------------------------------------------------------
     """
     )
+    # if args.pre_train is not None:
+    #     model = BrepSeg.load_from_checkpoint(args.pre_train, args=args, strict=False)
+    # else:
+    #     model = BrepSeg(args)
+    
     model = BrepSeg(args)
 
     train_data = Dataset(root_dir=args.dataset_path, split="train", random_rotate=True, num_class=args.num_classes)

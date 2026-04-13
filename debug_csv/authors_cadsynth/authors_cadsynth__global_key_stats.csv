@@ -1,0 +1,17 @@
+dataset,key,dtype,min,max,count,nan_count,inf_count,unique_approx
+authors_cadsynth,aux:angle_distance,torch.float32,0.0,1.0,5542075072,0,0,0
+authors_cadsynth,aux:d2_distance,torch.float32,0.0,1.0,5542075072,0,0,0
+authors_cadsynth,aux:edges_path,torch.int32,-1.0,493.0,511020217,0,0,495
+authors_cadsynth,aux:spatial_pos,torch.int32,0.0,18.0,86594923,0,0,19
+authors_cadsynth,derived:node_degree,torch.int64,1.0,36.0,2797077,0,0,34
+authors_cadsynth,edata:a,torch.float32,-3.1415927410125732,3.1415927410125732,14007606,0,0,0
+authors_cadsynth,edata:c,torch.int32,0.0,2.0,14007606,0,0,3
+authors_cadsynth,edata:l,torch.float32,0.00020010415755677968,6.9705681800842285,14007606,0,0,0
+authors_cadsynth,edata:t,torch.int32,0.0,5.0,14007606,0,0,5
+authors_cadsynth,edata:x,torch.float32,-100.63323974609375,167.06739807128906,490266210,0,0,0
+authors_cadsynth,ndata:a,torch.int32,1.0,37.0,2797077,0,0,36
+authors_cadsynth,ndata:f,torch.int32,0.0,24.0,2797077,0,0,25
+authors_cadsynth,ndata:l,torch.int32,1.0,9.0,2797077,0,0,7
+authors_cadsynth,ndata:x,torch.float32,-1.6348178386688232,1.757861852645874,489488475,0,0,0
+authors_cadsynth,ndata:y,torch.float32,4.0001563320402056e-05,12.566370964050293,2797077,0,0,0
+authors_cadsynth,ndata:z,torch.int32,0.0,5.0,2797077,0,0,6

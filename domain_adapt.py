@@ -24,7 +24,7 @@ parser.add_argument("--open_set", type=int, default=0)
 parser.add_argument("--dataset", choices=("cadsynth", "transfer"), default="transfer", help="Dataset to train on")
 parser.add_argument("--source_path", type=str, help="Path to source_dataset")
 parser.add_argument("--target_path", type=str, help="Path to target_dataset")
-parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
 parser.add_argument(
     "--num_workers",
     type=int,
@@ -71,7 +71,8 @@ if not results_path.exists():
 month_day = time.strftime("%m%d")
 hour_min_second = time.strftime("%H%M%S")
 checkpoint_callback = ModelCheckpoint(
-    monitor="eval_loss",
+    monitor="per_face_accuracy_target",
+    mode="max",
     dirpath=str(results_path.joinpath(month_day, hour_min_second)),
     filename="best",
     save_top_k=10,

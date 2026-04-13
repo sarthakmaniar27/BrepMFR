@@ -188,7 +188,7 @@ class BrepEncoder(nn.Module):
                                         batch_data["face_loop"],
                                         batch_data["in_degree"],
                                         batch_data["padding_mask"])  
-            # x[batch_size, max_node, embedding_dim] 每个节点均嵌入到长度embedding_dim的向量
+            # x[batch_size, max_node, embedding_dim]: Each node is embedded into a vector of length `embedding_dim`.
 
         if perturb is not None:
             x[:, 1:, :] += perturb

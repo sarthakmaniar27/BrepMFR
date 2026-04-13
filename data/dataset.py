@@ -25,7 +25,7 @@ class CADSynth(Dataset):
         root_dir,
         split="train",
         random_rotate=False,
-        num_class=25,
+        num_class=33,
     ):  
         assert split in ("train", "val", "test")
         path = pathlib.Path(root_dir)
@@ -82,8 +82,14 @@ class CADSynth(Dataset):
         basename = os.path.basename(file_path).replace(file_extension, "")
         pyg_graph.data_id = int(basename.split("_")[-1])
 
-        if(torch.max(pyg_graph.label_feature) > 24 or torch.max(pyg_graph.label_feature) < 0):
-            print(pyg_graph.data_id)
+        # if(torch.max(pyg_graph.label_feature) > 24 or torch.max(pyg_graph.label_feature) < 0):
+        #     print(pyg_graph.data_id)
+
+        if torch.max(pyg_graph.label_feature) >= self.num_class or torch.min(pyg_graph.label_feature) < 0:
+            print(f"Invalid label in graph id: {pyg_graph.data_id}, "
+                f"min={torch.min(pyg_graph.label_feature).item()}, "
+                f"max={torch.max(pyg_graph.label_feature).item()}, "
+                f"expected range=[0, {self.num_class - 1}]")
 
         return pyg_graph
 

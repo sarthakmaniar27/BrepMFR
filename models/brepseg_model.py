@@ -83,6 +83,44 @@ class Attention(nn.Module):
 
 
 class BrepSeg(pl.LightningModule):
+    # def __init__(self, args):
+    #     super().__init__()
+    #     self.save_hyperparameters()
+    #     self.num_classes = args.num_classes
+
+    #     self.brep_encoder = BrepEncoder(
+    #         # < for graphormer
+    #         num_degree=128,  # number of in degree types in the graph
+    #         num_spatial=64,  # number of spatial types in the graph
+    #         num_edge_dis=64,  # number of edge dis types in the graph
+    #         edge_type="multi_hop",  # edge type in the graph "multi_hop"
+    #         multi_hop_max_dist=16,  # max distance of multi-hop edges
+    #         # >
+    #         num_encoder_layers=args.n_layers_encode,  # num encoder layers
+    #         embedding_dim=args.dim_node,  # encoder embedding dimension
+    #         ffn_embedding_dim=args.d_model,  # encoder embedding dimension for FFN
+    #         num_attention_heads=args.n_heads,  # num encoder attention heads
+    #         dropout=args.dropout,  # dropout probability
+    #         attention_dropout=args.attention_dropout,  # dropout probability for"attention weights"
+    #         activation_dropout=args.act_dropout,  # dropout probability after"activation in FFN"
+    #         layerdrop=0.1,
+    #         encoder_normalize_before=True,  # apply layernorm before each encoder block
+    #         pre_layernorm=True,
+    #         # apply layernorm before self-attention and ffn. Without this, post layernorm will used
+    #         apply_params_init=True,  # use custom param initialization for Graphormer
+    #         activation_fn="gelu",  # activation function to use
+    #     )
+
+    #     self.attention = Attention(args.dim_node)
+
+    #     self.classifier = NonLinearClassifier(args.dim_node, args.num_classes, args.dropout)
+
+    #     self.pred = []
+    #     self.label = []
+
+
+
+    #    # Optional: freeze encoder for first few epochs when fine-tuning 
     def __init__(self, args):
         super().__init__()
         self.save_hyperparameters()
@@ -101,8 +139,8 @@ class BrepSeg(pl.LightningModule):
             ffn_embedding_dim=args.d_model,  # encoder embedding dimension for FFN
             num_attention_heads=args.n_heads,  # num encoder attention heads
             dropout=args.dropout,  # dropout probability
-            attention_dropout=args.attention_dropout,  # dropout probability for"attention weights"
-            activation_dropout=args.act_dropout,  # dropout probability after"activation in FFN"
+            attention_dropout=args.attention_dropout,  # dropout probability for "attention weights"
+            activation_dropout=args.act_dropout,  # dropout probability after "activation in FFN"
             layerdrop=0.1,
             encoder_normalize_before=True,  # apply layernorm before each encoder block
             pre_layernorm=True,
@@ -112,12 +150,98 @@ class BrepSeg(pl.LightningModule):
         )
 
         self.attention = Attention(args.dim_node)
-
         self.classifier = NonLinearClassifier(args.dim_node, args.num_classes, args.dropout)
 
         self.pred = []
         self.label = []
 
+        # Optional: freeze encoder for first few epochs when fine-tuning
+        self.warmup_freeze_epochs = getattr(args, "warmup_freeze_epochs", 0)
+
+        # ---------------------------------------------------------
+        # Load pretrained Stage-1 checkpoint selectively
+        # - load brep_encoder
+        # - load attention
+        # - load only classifier weights whose shapes match
+        # ---------------------------------------------------------
+        if getattr(args, "pre_train", None):
+            print(f"\nLoading pretrained checkpoint from: {args.pre_train}")
+            ckpt = torch.load(args.pre_train, map_location="cpu")
+
+            # Lightning checkpoints usually store model weights in "state_dict"
+            state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+
+            # -------------------------
+            # 1) Load brep_encoder
+            # -------------------------
+            encoder_state = {
+                k.replace("brep_encoder.", "", 1): v
+                for k, v in state_dict.items()
+                if k.startswith("brep_encoder.")
+            }
+
+            enc_msg = self.brep_encoder.load_state_dict(encoder_state, strict=False)
+            print("Loaded brep_encoder")
+            print("  missing keys    :", enc_msg.missing_keys)
+            print("  unexpected keys :", enc_msg.unexpected_keys)
+
+            # -------------------------
+            # 2) Load attention
+            # -------------------------
+            attention_state = {
+                k.replace("attention.", "", 1): v
+                for k, v in state_dict.items()
+                if k.startswith("attention.")
+            }
+
+            att_msg = self.attention.load_state_dict(attention_state, strict=False)
+            print("Loaded attention")
+            print("  missing keys    :", att_msg.missing_keys)
+            print("  unexpected keys :", att_msg.unexpected_keys)
+
+            # -------------------------
+            # 3) Partially load classifier
+            #    only matching shapes
+            # -------------------------
+            classifier_state = {
+                k.replace("classifier.", "", 1): v
+                for k, v in state_dict.items()
+                if k.startswith("classifier.")
+            }
+
+            current_classifier_state = self.classifier.state_dict()
+            filtered_classifier_state = {}
+            skipped_classifier_keys = []
+
+            for k, v in classifier_state.items():
+                if k in current_classifier_state and current_classifier_state[k].shape == v.shape:
+                    filtered_classifier_state[k] = v
+                else:
+                    skipped_classifier_keys.append(k)
+
+            current_classifier_state.update(filtered_classifier_state)
+            cls_msg = self.classifier.load_state_dict(current_classifier_state, strict=False)
+
+            print("Partially loaded classifier")
+            print("  loaded keys     :", list(filtered_classifier_state.keys()))
+            print("  skipped keys    :", skipped_classifier_keys)
+            print("  missing keys    :", cls_msg.missing_keys)
+            print("  unexpected keys :", cls_msg.unexpected_keys)
+
+            # -------------------------
+            # 4) Optional encoder freeze
+            # -------------------------
+            if self.warmup_freeze_epochs > 0:
+                print(f"Freezing brep_encoder for first {self.warmup_freeze_epochs} epoch(s)")
+                for p in self.brep_encoder.parameters():
+                    p.requires_grad = False
+
+    # Gradually unfreeze encoder after warmup_freeze_epochs
+    def on_train_epoch_start(self):
+        if self.warmup_freeze_epochs > 0 and self.current_epoch == self.warmup_freeze_epochs:
+            print(f"Unfreezing brep_encoder at epoch {self.current_epoch}")
+            for p in self.brep_encoder.parameters():
+                p.requires_grad = True
 
     def training_step(self, batch, batch_idx):
         self.brep_encoder.train()
@@ -224,25 +348,25 @@ class BrepSeg(pl.LightningModule):
         for i in range(len(labels_np)): self.label.append(labels_np[i])
 
         # 将结果转为txt文件----------------------------------------------------------------------------
-        n_graph, max_n_node = batch["padding_mask"].size()[:2]
-        node_pos = torch.where(batch["padding_mask"] == False)
-        face_feature = -1 * torch.ones([n_graph, max_n_node], device=self.device, dtype=torch.long)
-        face_feature[node_pos] = preds[:]
-        out_face_feature = face_feature.long().detach().cpu().numpy()  # [n_graph, max_n_node]
-        for i in range(n_graph):
-            # 计算每个graph的实际n_node
-            end_index = max_n_node - np.sum((out_face_feature[i][:] == -1).astype(np.int))
-            # masked出实际face feature
-            pred_feature = out_face_feature[i][:end_index + 1]  # (n_node)
+        # n_graph, max_n_node = batch["padding_mask"].size()[:2]
+        # node_pos = torch.where(batch["padding_mask"] == False)
+        # face_feature = -1 * torch.ones([n_graph, max_n_node], device=self.device, dtype=torch.long)
+        # face_feature[node_pos] = preds[:]
+        # out_face_feature = face_feature.long().detach().cpu().numpy()  # [n_graph, max_n_node]
+        # for i in range(n_graph):
+        #     # 计算每个graph的实际n_node
+        #     end_index = max_n_node - np.sum((out_face_feature[i][:] == -1).astype(np.int))
+        #     # masked出实际face feature
+        #     pred_feature = out_face_feature[i][:end_index + 1]  # (n_node)
 
-            output_path = pathlib.Path("/home/zhang/datasets_segmentation/2_val")
-            file_name = "feature_" + str(batch["id"][i].long().detach().cpu().numpy()) + ".txt"
-            file_path = os.path.join(output_path, file_name)
-            feature_file = open(file_path, mode="a")
-            for j in range(end_index):
-                feature_file.write(str(pred_feature[j]))
-                feature_file.write("\n")
-            feature_file.close()
+        #     output_path = pathlib.Path("/home/zhang/datasets_segmentation/2_val")
+        #     file_name = "feature_" + str(batch["id"][i].long().detach().cpu().numpy()) + ".txt"
+        #     file_path = os.path.join(output_path, file_name)
+        #     feature_file = open(file_path, mode="a")
+        #     for j in range(end_index):
+        #         feature_file.write(str(pred_feature[j]))
+        #         feature_file.write("\n")
+        #     feature_file.close()
 
     def test_epoch_end(self, outputs):
         print("num_classes: %s" % self.num_classes)
@@ -301,35 +425,124 @@ class BrepSeg(pl.LightningModule):
         #         result_file.write("\n")
         # result_file.close()
 
+    # original configure_optimizers() function
+
+    # def configure_optimizers(self):
+    #     optimizer = torch.optim.AdamW(self.parameters(), lr=0.002, betas=(0.99, 0.999))
+
+    #     # Learning Strategies
+    #     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
+    #                                                            threshold=0.0001, threshold_mode='rel',
+    #                                                            min_lr=0.000001, cooldown=2, verbose=False)
+
+    #     return {"optimizer": optimizer,
+    #             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1, "monitor": "eval_loss"}
+    #             }
+
+    # code matching paper's values    # def configure_optimizers(self):
+
+    # def configure_optimizers(self):
+    #         optimizer = torch.optim.AdamW(
+    #             self.parameters(),
+    #             lr=0.001,
+    #             betas=(0.9, 0.999),
+    #             eps=1e-8,
+    #             weight_decay=0.01,
+    #         )
+
+    #         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    #             optimizer,
+    #             mode="min",
+    #             factor=0.5,
+    #             patience=5,
+    #             threshold=1e-4,
+    #             threshold_mode="rel",
+    #             min_lr=1e-6,
+    #             cooldown=2,
+    #             verbose=False,
+    #         )
+
+    #         return {
+    #             "optimizer": optimizer,
+    #             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1, "monitor": "eval_loss"},
+    #         }
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=0.002, betas=(0.99, 0.999))
+        encoder_params = [p for p in self.brep_encoder.parameters() if p.requires_grad]
+        attention_params = [p for p in self.attention.parameters() if p.requires_grad]
+        classifier_params = [p for p in self.classifier.parameters() if p.requires_grad]
 
-        # 学习策略
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5,
-                                                               threshold=0.0001, threshold_mode='rel',
-                                                               min_lr=0.000001, cooldown=2, verbose=False)
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": encoder_params, "lr": 1e-4},
+                {"params": attention_params, "lr": 3e-4},
+                {"params": classifier_params, "lr": 5e-4},
+            ],
+            betas=(0.9, 0.999),
+            weight_decay=1e-2,
+        )
 
-        return {"optimizer": optimizer,
-                "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1, "monitor": "eval_loss"}
-                }
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=15,
+            threshold=1e-4,
+            threshold_mode="rel",
+            min_lr=1e-5,
+            cooldown=5,
+            verbose=False,
+        )
 
-    # 逐渐增大学习率
-    def optimizer_step(self,
-                       epoch,
-                       batch_idx,
-                       optimizer,
-                       optimizer_idx,
-                       optimizer_closure,
-                       on_tpu,
-                       using_native_amp,
-                       using_lbfgs,
-                       ):
-        # update params
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+                "monitor": "eval_loss",
+            },
+        }
+
+
+    # Gradually increase the learning rate
+    # def optimizer_step(self,
+    #                    epoch,
+    #                    batch_idx,
+    #                    optimizer,
+    #                    optimizer_idx,
+    #                    optimizer_closure,
+    #                    on_tpu,
+    #                    using_native_amp,
+    #                    using_lbfgs,
+    #                    ):
+    #     # update params
+    #     optimizer.step(closure=optimizer_closure)
+
+    #     # manually warm up lr without a scheduler
+    #     if self.trainer.global_step < 5000:
+    #         lr_scale = min(1.0, float(self.trainer.global_step + 1) / 5000.0)
+    #         for pg in optimizer.param_groups:
+    #             # pg["lr"] = lr_scale * 0.002
+    #             pg["lr"] = lr_scale * 0.001
+
+
+    def optimizer_step(
+        self,
+        epoch,
+        batch_idx,
+        optimizer,
+        optimizer_idx,
+        optimizer_closure,
+        on_tpu,
+        using_native_amp,
+        using_lbfgs,
+    ):
         optimizer.step(closure=optimizer_closure)
 
-        # manually warm up lr without a scheduler
         if self.trainer.global_step < 5000:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / 5000.0)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * 0.002
+            base_lrs = [1e-4, 3e-4, 5e-4]
+
+            for pg, base_lr in zip(optimizer.param_groups, base_lrs):
+                pg["lr"] = lr_scale * base_lr

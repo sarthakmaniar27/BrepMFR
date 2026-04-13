@@ -178,22 +178,21 @@ class GraphNodeFeature(nn.Module):
     Compute node features for each node in the graph.
     """
 
-    def __init__(
-            self, num_heads, num_degree, hidden_dim, n_layers
-    ):
+    def __init__(self, num_heads, num_degree, hidden_dim, n_layers):
         super(GraphNodeFeature, self).__init__()
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim
+
         # node_feature encode
         self.surf_encoder = SurfaceEncoder(
-            in_channels=7, output_dims=int(0.5*hidden_dim)
+            in_channels=7, output_dims=int(0.5 * hidden_dim)
         )
-        # self.face_area_encoder = nn.Linear(1, int(0.125*hidden_dim), bias=False)
-        self.face_area_encoder = NonLinear(1, int(0.125*hidden_dim))
-        self.face_type_encoder = nn.Embedding(6, int(0.125*hidden_dim), padding_idx=0)
-        self.face_loop_encoder = nn.Embedding(256, int(0.125*hidden_dim), padding_idx=0)
-        self.degree_encoder = nn.Embedding(num_degree, int(0.125*hidden_dim), padding_idx=0)
+        self.face_area_encoder = NonLinear(1, int(0.125 * hidden_dim))
+        self.face_type_encoder = nn.Embedding(8, int(0.125 * hidden_dim), padding_idx=0)
+        self.face_loop_encoder = nn.Embedding(256, int(0.125 * hidden_dim), padding_idx=0)
+        self.degree_encoder = nn.Embedding(num_degree, int(0.125 * hidden_dim), padding_idx=0)
         self.graph_token = nn.Embedding(1, hidden_dim)
+
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
     def forward(self, x, face_area, face_type, face_loop, face_degree, padding_mask):
@@ -201,21 +200,32 @@ class GraphNodeFeature(nn.Module):
         # padding_mask [batch_size, max_node_num] 记录每个graph的实际长度，空位记为True
         n_graph, n_node = padding_mask.size()[:2]
         node_pos = torch.where(padding_mask == False)
+
         x = x.permute(0, 3, 1, 2)
         x_ = self.surf_encoder(x)  # [total_nodes, n_hidden]
         face_area_ = self.face_area_encoder(face_area.unsqueeze(dim=1))  # [total_nodes, n_hidden]
+
+        # ---------------- DEBUG: face_type range check ----------------
+        # if True:  # or use a debug flag
+        #     ft_min = int(face_type.min())
+        #     ft_max = int(face_type.max())
+        #     print(f"[DBG] face_type min/max: {ft_min} {ft_max} num_embeddings: {self.face_type_encoder.num_embeddings}")
+        # -------------------------------------------------------------
+
         face_type_ = self.face_type_encoder(face_type)  # [total_nodes, n_hidden]
         face_loop_ = self.face_loop_encoder(face_loop)
         face_degree_ = self.degree_encoder(face_degree)
+
         node_feature = torch.cat((x_, face_area_, face_type_, face_loop_, face_degree_), dim=-1)
 
         face_feature = torch.zeros([n_graph, n_node, self.hidden_dim], device=x.device, dtype=x.dtype)
-        face_feature[node_pos] = node_feature[:]  # [total_nodes, n_hidden]->[n_graph, max_node_num, n_hidden] 空节点用0.0填充
+        face_feature[node_pos] = node_feature[:]  # 空节点用0.0填充
 
         # 增加一个全局虚拟节点 [n_graph, 1, n_hidden]
         graph_token_feature = self.graph_token.weight.unsqueeze(0).repeat(n_graph, 1, 1)
         graph_node_feature = torch.cat([graph_token_feature, face_feature], dim=1)  # [n_graph, max_node_num+1, n_hidden]
         return graph_node_feature, node_feature
+
 
 
 class _MLP(nn.Module):
@@ -358,6 +368,69 @@ class GraphAttnBias(nn.Module):
         graph_attn_bias = graph_attn_bias.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
         # [n_graph, n_head, n_node+1, n_node+1] 描述每一头注意力下各节点之间的关系矩阵
 
+
+
+
+        # ---- DEBUG: spatial_pos sanity ----
+        # if not hasattr(self, "_dbg_done"):
+        #     self._dbg_done = 0
+
+        # if self._dbg_done < 5:  # print only first few batches
+        #     with torch.no_grad():
+        #         sp = spatial_pos
+        #         # Ensure on CPU for printing if needed
+        #         sp_min = int(sp.min().item()) if sp.numel() > 0 else None
+        #         sp_max = int(sp.max().item()) if sp.numel() > 0 else None
+        #         num_spatial = int(self.spatial_pos_encoder.num_embeddings)
+        #         pad_idx = self.spatial_pos_encoder.padding_idx
+
+        #         print("\n[DEBUG][GraphAttnBias] spatial_pos stats:")
+        #         print(f"  spatial_pos shape: {tuple(sp.shape)} dtype={sp.dtype} device={sp.device}")
+        #         print(f"  spatial_pos min/max: {sp_min} / {sp_max}")
+        #         print(f"  spatial_pos_encoder.num_embeddings: {num_spatial} (valid idx: 0..{num_spatial-1})")
+        #         print(f"  spatial_pos_encoder.padding_idx: {pad_idx}")
+
+        #         bad_hi = (sp >= num_spatial)
+        #         bad_lo = (sp < 0)
+        #         if bad_hi.any() or bad_lo.any():
+        #             n_bad = int((bad_hi | bad_lo).sum().item())
+        #             print(f"  !!! FOUND OOB spatial_pos indices: {n_bad}")
+        #             # show a few offending positions/values
+        #             bad_idx = torch.nonzero(bad_hi | bad_lo)[:10]
+        #             print(f"  first bad indices (up to 10): {bad_idx.tolist()}")
+        #             print(f"  first bad values: {sp[bad_idx[:,0], bad_idx[:,1], bad_idx[:,2]].tolist()}")
+        #             # hard fail early with clear message (better than CUDA assert)
+        #             raise RuntimeError(
+        #                 f"OOB spatial_pos indices detected. max={sp_max}, "
+        #                 f"but spatial_pos_encoder.num_embeddings={num_spatial}"
+        #             )
+
+        #     self._dbg_done += 1
+        # ---- DEBUG END ----
+
+        # spatial_pos must be in [0, num_embeddings-1]
+        
+        # new code starts here: we clamp spatial_pos to the valid range [0, num_spatial-1] and treat out-of-range values as padding (which will be ignored in the attention bias)
+        num_spatial = self.spatial_pos_encoder.num_embeddings
+
+        # optional but recommended: treat "unreachable" as 0 padding
+        spatial_pos = spatial_pos.clone()
+        spatial_pos[spatial_pos < 0] = 0
+
+        spatial_pos = spatial_pos.clamp(0, num_spatial - 1)
+        
+        # new code ends here
+
+        # debug: print spatial_pos stats and check for out-of-range values before encoding
+
+        # spatial_pos = spatial_pos.to(torch.long)
+        # ns = self.spatial_pos_encoder.num_embeddings
+        # sp_min, sp_max = int(spatial_pos.min()), int(spatial_pos.max())
+        # print("[DBG] spatial_pos min/max:", sp_min, sp_max, "num_embeddings:", ns)
+        # assert 0 <= sp_min and sp_max < ns
+
+
+
         # spatial_pos 空间编码------------------------------------------------------------------------------------------------------------
         spatial_pos_bias = self.spatial_pos_encoder(spatial_pos)  # spatial_pos_bias[n_graph, n_node, n_node, n_head]
         spatial_pos_bias = spatial_pos_bias.permute(0, 3, 1, 2)  # spatial_pos_bias[n_graph, n_head, n_node, n_node]
@@ -387,35 +460,148 @@ class GraphAttnBias(nn.Module):
 
         # edge_feature 边编码------------------------------------------------------------------------------------------------------------
         if self.edge_type == "multi_hop":
-            spatial_pos_ = spatial_pos.clone()  # 记录任意两节点之间的距离[batch_size, max_node_num, max_node_num] 自己到自己的距离记为1
-            spatial_pos_[spatial_pos_ == 0] = 1  # set pad to 1  空位（可以看作是虚拟节点） 统一为1，自己到自己的距离记为1
+            spatial_pos_ = spatial_pos.clone()  # Record the distance between any two nodes [batch_size, max_node_num, max_node_num]. The distance from a node to itself is recorded as 1.
+            spatial_pos_[spatial_pos_ == 0] = 1  # Set the padding to 1. Empty spaces (which can be considered virtual nodes) are uniformly set to 1, and the distance from a node to itself is also recorded as 1.
             # set 1 to 1, x > 1 to x - 1
-            spatial_pos_ = torch.where(spatial_pos_ > 1, spatial_pos_ - 1, spatial_pos_)  # 调整后两个直接相连的节点之间距离也是1
+            spatial_pos_ = torch.where(spatial_pos_ > 1, spatial_pos_ - 1, spatial_pos_)  # After adjustment, the distance between any two directly connected nodes is also 1.
             spatial_pos_ = spatial_pos_.clamp(0, self.multi_hop_max_dist)
 
-            # 缩减edge_input
+            # Reduce edge_input
             max_dist = self.multi_hop_max_dist
             edge_pos = torch.where(edge_padding_mask == False)  # edge_padding_mask [batch_size, max_edges_num]
 
-            # 调整维度，进行curv_encode
+            # Adjust the dimensions and perform curv_encode.
             edge_data = edge_data.permute(0, 2, 1)
             edge_data_ = self.curv_encoder(edge_data)  # [total_edges, n_head]
+
+
+            # ---- DEBUG: edge_type / edge_conv sanity ----
+            # if not hasattr(self, "_dbg_edge_meta"):
+            #     self._dbg_edge_meta = 0
+
+            # if self._dbg_edge_meta < 3:
+            #     with torch.no_grad():
+            #         et = edge_type
+            #         ec = edge_conv
+
+            #         et_min = int(et.min().item()) if et.numel() else None
+            #         et_max = int(et.max().item()) if et.numel() else None
+            #         ec_min = int(ec.min().item()) if ec.numel() else None
+            #         ec_max = int(ec.max().item()) if ec.numel() else None
+
+            #         et_vocab = int(self.edge_type_encoder.num_embeddings)  # should be 6
+            #         ec_vocab = int(self.edge_conv_encoder.num_embeddings)  # should be 3
+
+            #         print("\n[DEBUG][GraphAttnBias] edge_type/edge_conv stats:", flush=True)
+            #         print(f"  edge_type shape={tuple(et.shape)} dtype={et.dtype} min/max={et_min}/{et_max} vocab={et_vocab} (valid 0..{et_vocab-1})", flush=True)
+            #         print(f"  edge_conv shape={tuple(ec.shape)} dtype={ec.dtype} min/max={ec_min}/{ec_max} vocab={ec_vocab} (valid 0..{ec_vocab-1})", flush=True)
+
+            #         bad_et = (et < 0) | (et >= et_vocab)
+            #         bad_ec = (ec < 0) | (ec >= ec_vocab)
+
+            #         if bad_et.any():
+            #             n = int(bad_et.sum().item())
+            #             vals = et[bad_et][:10].tolist()
+            #             print(f"  !!! OOB edge_type count={n}, first_vals={vals}", flush=True)
+            #             raise RuntimeError(f"OOB edge_type detected: min/max={et_min}/{et_max}, vocab={et_vocab}")
+
+            #         if bad_ec.any():
+            #             n = int(bad_ec.sum().item())
+            #             vals = ec[bad_ec][:10].tolist()
+            #             print(f"  !!! OOB edge_conv count={n}, first_vals={vals}", flush=True)
+            #             raise RuntimeError(f"OOB edge_conv detected: min/max={ec_min}/{ec_max}, vocab={ec_vocab}")
+
+            #     self._dbg_edge_meta += 1
+            # ---- DEBUG END ----
+
+            
+            # debug: print edge_type and edge_conv stats and check for out-of-range values before encoding
+
+            # edge_type = edge_type.to(torch.long)
+            # nt = self.edge_type_encoder.num_embeddings
+            # et_min, et_max = int(edge_type.min()), int(edge_type.max())
+            # print("[DBG] edge_type min/max:", et_min, et_max, "num_embeddings:", nt)
+            # assert 0 <= et_min and et_max < nt
+
+
+
             edge_type_ = self.edge_type_encoder(edge_type)
             edge_len_ = self.edge_len_encoder(edge_len.unsqueeze(dim=1))
             edge_ang_ = self.edge_ang_encoder(edge_ang.unsqueeze(dim=1))
+
+            # edge_conv is already in the form of [0, 1, 2] in the converter, where 0 means no edge, 1 means convex edge, and 2 means concave edge. 
+            # We directly encode it with an embedding layer. The padding index is set to 0, which will be ignored in the attention bias. 
+            
+            # edge_conv = edge_conv.to(torch.long)
+            # ec_vocab = int(self.edge_conv_encoder.num_embeddings)
+            # ec_min, ec_max = int(edge_conv.min()), int(edge_conv.max())
+            # print("[DBG] edge_conv min/max:", ec_min, ec_max, "num_embeddings:", ec_vocab)
+            # assert 0 <= ec_min and ec_max < ec_vocab
+
+
             edge_conv_ = self.edge_conv_encoder(edge_conv)
             edge_feat = edge_data_ + edge_type_ + edge_len_ + edge_ang_ + edge_conv_
 
             # add node_feature to edge_feature
             edge_feat_ = self.node_cat(graph, node_feat, edge_feat)  # [total_edges, n_head]
 
-            # edge_input扩充 [total_edges, n_head]->[n_graph, max_node_num, max_node_num, max_dist, n_head]
+            # Edge input expansion [total_edges, n_head]->[n_graph, max_node_num, max_node_num, max_dist, n_head]
             n_edge = edge_padding_mask.size(1)
             edge_feature = torch.zeros([n_graph, (n_edge + 1), edge_feat_.size(-1)], device=edge_data.device, dtype=edge_data.dtype)
             edge_feature[edge_pos] = edge_feat_[:][:]  # edge_feature[n_graph, max_edge_num+1, n_head]
 
             edge_path = edge_path.reshape(n_graph, n_node * n_node * max_dist)
+
+
+            
+            # edge_feature has shape [n_graph, n_edge+1, ...]
+            # the last index (n_edge) is reserved as the all-zero padding row
+            pad_idx = edge_padding_mask.size(1)  # == n_edge in the batch
+            edge_path = edge_path.to(torch.long)
+            edge_path = torch.where(edge_path < 0, torch.full_like(edge_path, pad_idx), edge_path)
+            edge_path = edge_path.clamp(0, pad_idx)
+
+
             dim_0 = torch.arange(n_graph, device=edge_path.device).reshape(n_graph, 1).long()
+
+            # ---- DEBUG: edge_path sanity ----
+            # if self._dbg_done < 5:
+            #     with torch.no_grad():
+            #         ep = edge_path
+            #         ep_min = int(ep.min().item()) if ep.numel() > 0 else None
+            #         ep_max = int(ep.max().item()) if ep.numel() > 0 else None
+            #         ef_dim1 = int(edge_feature.size(1))  # valid: 0..ef_dim1-1
+
+            #         print("\n[DEBUG][GraphAttnBias] edge_path stats:")
+            #         print(f"  edge_path shape: {tuple(ep.shape)} dtype={ep.dtype} device={ep.device}")
+            #         print(f"  edge_path min/max: {ep_min} / {ep_max}")
+            #         print(f"  edge_feature.size(1): {ef_dim1} (valid idx: 0..{ef_dim1-1})")
+
+            #         # Note: -1 is used as padding in your converter; this indexing path does NOT support -1 safely.
+            #         bad_hi = (ep >= ef_dim1)
+            #         bad_lo = (ep < 0)
+            #         if bad_hi.any() or bad_lo.any():
+            #             n_bad = int((bad_hi | bad_lo).sum().item())
+            #             print(f"  !!! FOUND OOB edge_path indices: {n_bad}")
+            #             bad_idx = torch.nonzero(bad_hi | bad_lo)[:10]
+            #             print(f"  first bad indices: {bad_idx.tolist()}")
+            #             print(f"  first bad values: {ep.flatten()[bad_idx[:,0]].tolist() if ep.dim()==2 else 'see tensor'}")
+            #             raise RuntimeError(
+            #                 f"OOB edge_path indices detected. max={ep_max}, min={ep_min}, "
+            #                 f"edge_feature.size(1)={ef_dim1}"
+            #             )
+
+            # ---- DEBUG END ----
+
+
+            # debug: print edge_path stats and check for out-of-range values before indexing into edge_feature
+            # ef = edge_feature.size(1)
+            # ep_min, ep_max = int(edge_path.min()), int(edge_path.max())
+            # print("[DBG] edge_path min/max:", ep_min, ep_max, "edge_feature.size(1):", ef)
+            # assert 0 <= ep_min and ep_max < ef
+
+
+
             edge_bias = edge_feature[dim_0, edge_path]
             edge_bias = edge_bias.reshape(n_graph, n_node, n_node, max_dist, self.num_heads)
 

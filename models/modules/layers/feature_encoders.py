@@ -115,7 +115,7 @@ class _MLP(nn.Module):
 
 
 class CurveEncoder(nn.Module):
-    def __init__(self, in_channels=6, output_dims=64):
+    def __init__(self, in_channels=7, output_dims=64):
         """
         This is the 1D convolutional network that extracts features from the B-rep edge
         geometry described as 1D UV-grids (see Section 3.2, Curve & surface convolution
