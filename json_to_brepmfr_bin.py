@@ -79,52 +79,87 @@ def _compute_shortest_paths_edge_indices(src_nodes, dst_nodes, num_nodes, max_di
 
 def _build_a2_tensors(data: dict, face_id_to_node: dict, N: int) -> tuple:
     """
-    Builds d2_distance and angle_distance tensors from the face_pairs field in JSON.
+    Builds d2_distance and angle_distance tensors from face_pairs in JSON.
 
-    face_pairs stores one entry per unordered pair {i, j} with i != j.
-    The pair values are face IDs (matching face["id"]).
-    Both (i,j) and (j,i) are filled symmetrically from the same entry.
-    Diagonal entries (i==i) remain zero as per the paper (no self-spatial relation).
+    Design A:
+    - Exactly one JSON entry per unordered face pair
+    - entry["a3"]   = histogram for face_pair[0] -> face_pair[1]
+    - entry["a3_1"] = histogram for face_pair[1] -> face_pair[0]
 
-    Returns:
-        d2_distance  : torch.FloatTensor shape (N, N, 64)
-        angle_distance: torch.FloatTensor shape (N, N, 64)
+    D2 is symmetric.
+    A3 is asymmetric.
     """
     d2_distance = torch.zeros((N, N, 64), dtype=torch.float32)
     angle_distance = torch.zeros((N, N, 64), dtype=torch.float32)
 
     face_pairs = data.get("face_pairs", [])
     if not face_pairs:
-        # face_pairs key absent — return zeros (backward compat)
         return d2_distance, angle_distance
 
-    # Build lookup: (face_id_a, face_id_b) -> entry
-    # The JSON stores only one direction per pair — we handle both directions below.
+    # Build canonical lookup: one entry per unordered pair
     pair_lut = {}
     for entry in face_pairs:
-        fi, fj = int(entry["face_pair"][0]), int(entry["face_pair"][1])
-        pair_lut[(fi, fj)] = entry
+        fi = int(entry["face_pair"][0])
+        fj = int(entry["face_pair"][1])
 
-    # node_to_face_id is the inverse of face_id_to_node
+        if fi == fj:
+            # self-pairs are ignored; diagonal remains zero
+            continue
+
+        key = (min(fi, fj), max(fi, fj))
+
+        # Fail fast if JSON accidentally contains both [fi, fj] and [fj, fi]
+        # or duplicate unordered entries. Design A requires exactly one entry.
+        if key in pair_lut:
+            raise ValueError(
+                f"Duplicate unordered face pair found in JSON for faces {key}. "
+                f"Design A requires exactly one entry per unordered pair."
+            )
+
+        # Validate expected histogram lengths early
+        if len(entry["d2"]) != 64:
+            raise ValueError(f"d2 histogram for pair {fi, fj} does not have length 64")
+        if len(entry["a3"]) != 64:
+            raise ValueError(f"a3 histogram for pair {fi, fj} does not have length 64")
+        if len(entry["a3_1"]) != 64:
+            raise ValueError(f"a3_1 histogram for pair {fi, fj} does not have length 64")
+
+        pair_lut[key] = entry
+
     node_to_face_id = {v: k for k, v in face_id_to_node.items()}
 
     for ni in range(N):
         for nj in range(N):
             if ni == nj:
-                # Diagonal stays zero — paper explicitly zeros self-relations
                 continue
 
             fi = node_to_face_id[ni]
             fj = node_to_face_id[nj]
 
-            # Try both directions since JSON stores only one
-            entry = pair_lut.get((fi, fj)) or pair_lut.get((fj, fi))
+            key = (min(fi, fj), max(fi, fj))
+            entry = pair_lut.get(key)
             if entry is None:
-                # No pair data — leave as zero
+                # leave zeros if pair data is missing
                 continue
 
+            stored_f0 = int(entry["face_pair"][0])
+            stored_f1 = int(entry["face_pair"][1])
+
+            # D2 is symmetric
             d2_distance[ni, nj] = torch.tensor(entry["d2"], dtype=torch.float32)
-            angle_distance[ni, nj] = torch.tensor(entry["a3"], dtype=torch.float32)
+
+            # A3 is directional
+            if fi == stored_f0 and fj == stored_f1:
+                # same direction as stored pair
+                angle_distance[ni, nj] = torch.tensor(entry["a3"], dtype=torch.float32)
+            elif fi == stored_f1 and fj == stored_f0:
+                # reverse direction
+                angle_distance[ni, nj] = torch.tensor(entry["a3_1"], dtype=torch.float32)
+            else:
+                raise RuntimeError(
+                    f"Inconsistent face pair mapping for query ({fi}, {fj}) "
+                    f"against stored pair ({stored_f0}, {stored_f1})"
+                )
 
     return d2_distance, angle_distance
 

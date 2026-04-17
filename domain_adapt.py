@@ -28,7 +28,7 @@ parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
 parser.add_argument(
     "--num_workers",
     type=int,
-    default=12,
+    default=0,
     help="Number of workers for the dataloader. NOTE: set this to 0 on Windows, any other value leads to poor performance",
 )
 parser.add_argument(
@@ -61,6 +61,14 @@ parser.add_argument("--n_layers_encode", type=int, default=8)
 parser = Trainer.add_argparse_args(parser)
 args = parser.parse_args()
 
+# Validate required args early to avoid silent failures deep in model init
+if args.traintest == "train":
+    assert args.pre_train is not None, \
+        "Stage 2 training requires --pre_train (path to Stage 1 checkpoint)"
+    if args.max_epochs is None:
+        args.max_epochs = 200
+        print("[domain_adapt] --max_epochs not specified, defaulting to 200 for GRL schedule")
+
 results_path = (
     pathlib.Path(__file__).parent.joinpath("results").joinpath(args.experiment_name)
 )
@@ -74,8 +82,8 @@ checkpoint_callback = ModelCheckpoint(
     monitor="per_face_accuracy_target",
     mode="max",
     dirpath=str(results_path.joinpath(month_day, hour_min_second)),
-    filename="best",
-    save_top_k=10,
+    filename="best-{epoch:03d}-{per_face_accuracy_target:.4f}",
+    save_top_k=3,
     save_last=True,
 )
 
@@ -108,7 +116,7 @@ Logs written to results/{args.experiment_name}/{month_day}/{hour_min_second}
 To monitor the logs, run:
 tensorboard --logdir results/{args.experiment_name}/{month_day}/{hour_min_second}
 
-The trained model with the best validation loss will be written to:
+The trained model with the best per_face_accuracy_target will be written to:
 results/{args.experiment_name}/{month_day}/{hour_min_second}/best.ckpt
 -----------------------------------------------------------------------------------
     """
@@ -134,5 +142,5 @@ else:
 
     model = DomainAdapt.load_from_checkpoint(args.checkpoint)
 
-    trainer.test(model, dataloaders=[test_loader], ckpt_path=args.checkpoint, verbose=False)
+    trainer.test(model, dataloaders=[test_loader], verbose=False)
 

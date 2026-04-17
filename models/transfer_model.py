@@ -122,12 +122,18 @@ class DomainAdapt(pl.LightningModule):
 
 
         from models.modules.domain_adv.grl import WarmStartGradientReverseLayer
-        estimated_steps_per_epoch = 1400 # use 2800 for batch size 32
-        max_training_iters = args.max_epochs * estimated_steps_per_epoch  # 200 * 1400 = 280,000
+        # Base calibration: 1400 steps/epoch at batch_size=64 (original repo).
+        # Scale inversely with batch_size so the GRL lambda ramp speed is
+        # consistent regardless of which batch size you run with.
+        estimated_steps_per_epoch = max(1, round(1400 * 64 / args.batch_size))
+        max_training_iters = args.max_epochs * estimated_steps_per_epoch
+        print(f"[GRL] batch_size={args.batch_size}, "
+              f"estimated_steps_per_epoch={estimated_steps_per_epoch}, "
+              f"max_training_iters={max_training_iters}")
         grl = WarmStartGradientReverseLayer(
             alpha=1., lo=0., hi=1.,
             max_iters=max_training_iters,
-            auto_step=False  # manual stepping only during training
+            auto_step=False  # manual stepping only during training_step
         )
         domain_discri = DomainDiscriminator(args.dim_node, hidden_size=512)
         self.domain_adv = DomainAdversarialLoss(domain_discri, grl=grl)
@@ -384,10 +390,12 @@ class DomainAdapt(pl.LightningModule):
         self.log("train_acc_t", np.mean(per_face_comp_t), on_step=True, on_epoch=True)
         # ===============================================================================================
 
-        loss = loss_s + 0.3 * loss_adv + 0.1 * loss_t  # original paper's values 
-        # loss = loss_s + 0.1 * loss_adv + 0.02 * loss_t  # Run E
-        # loss = loss_s + 0.1 * loss_adv  # Run B
-        # loss = loss_s + 0.1 * loss_adv + 0.1 * loss_t # Run D
+        # Entropy (loss_t) disabled: confirmed confirmation-bias collapse in run at ep22
+        # (train_loss_t dropped to 0.006 while target accuracy fell from 77%→74%).
+        # Re-enable with a small coefficient (e.g. 0.01) only after alignment stabilises.
+        loss = loss_s + 0.3 * loss_adv   # α=0 entropy, β=0.3 adversarial
+        # loss = loss_s + 0.3 * loss_adv + 0.1 * loss_t  # original paper's values
+        # loss = loss_s + 0.1 * loss_adv                  # weaker adversarial
 
         self.log("train_loss", loss, on_step=False, on_epoch=True)
         return loss
@@ -534,10 +542,8 @@ class DomainAdapt(pl.LightningModule):
 
         loss_adv = self.domain_adv(z_s_, z_t_, weight_s, weight_t)
 
-        # real combined validation objective
-        val_obj = loss_s + 0.3 * loss_adv + 0.1 * loss_t
-        # val_obj = loss_s + 0.1 * loss_adv + 0.1 * loss_t
-        # val_obj = loss_s + 0.1 * loss_adv + 0.02 * loss_t
+        # match training loss (entropy disabled)
+        val_obj = loss_s + 0.3 * loss_adv
 
         self.log("eval_loss_s", loss_s, on_step=False, on_epoch=True)
         self.log("eval_loss_t", loss_t, on_step=False, on_epoch=True)
@@ -774,66 +780,47 @@ class DomainAdapt(pl.LightningModule):
     # modified code matching paper's values
 
     def configure_optimizers(self):
+        # Pre-trained modules (encoder, attention, classifier): weight_decay=0.0
+        # Reason: AdamW weight decay shrinks weights by (1 - lr*wd) each step.
+        # With lr=1e-4, wd=0.01 over 200 epochs the pre-trained weights would
+        # decay to ~57% of their original values — destroying Stage 1 knowledge.
+        # Only the newly-added discriminator needs regularization.
         optimizer = torch.optim.AdamW(
             self.brep_encoder.parameters(),
-            lr=0.0001,                 # keep if you want conservative finetune
+            lr=0.0001,
             betas=(0.9, 0.999),
             eps=1e-8,
-            weight_decay=0.01,
+            weight_decay=0.0,      # no decay on pre-trained weights
         )
         optimizer.add_param_group({
             "params": self.attention.parameters(),
             "lr": 0.0001,
             "betas": (0.9, 0.999),
             "eps": 1e-8,
-            "weight_decay": 0.01,
+            "weight_decay": 0.0,   # no decay on pre-trained weights
         })
         optimizer.add_param_group({
             "params": self.classifier.parameters(),
             "lr": 0.0001,
             "betas": (0.9, 0.999),
             "eps": 1e-8,
-            "weight_decay": 0.01,
+            "weight_decay": 0.0,   # no decay on pre-trained weights
         })
         optimizer.add_param_group({
             "params": self.domain_adv.parameters(),
-            "lr": 0.001,               # keep higher for discriminator if you want
+            "lr": 0.001,           # discriminator trained from scratch — higher LR
             "betas": (0.9, 0.999),
             "eps": 1e-8,
-            "weight_decay": 0.01,
+            "weight_decay": 0.01,  # regularize the new discriminator
         })
 
-        # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        #     optimizer,
-        #     mode="max",
-        #     factor=0.5,
-        #     patience=5,
-        #     threshold=1e-4,
-        #     threshold_mode="rel",
-        #     min_lr=1e-6,
-        #     cooldown=2,
-        #     verbose=False,
-        # )
-
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="max",
-            factor=0.5,
-            patience=15,     # was 5 — too aggressive for noisy accuracy signal
-            threshold=1e-4,
-            threshold_mode="rel",
-            min_lr=1e-5,     # was 1e-6 — don't let LR die completely
-            cooldown=5,      # was 2 — give more recovery time after each reduction
-            verbose=False,
-        )
-
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1, "monitor": "per_face_accuracy_target"},  # monitor source loss for LR scheduling, since target loss can be noisy and source is more stable
-            # "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1, "monitor": "eval_loss"},
-            # "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1, "monitor": "per_face_accuracy_target"},
-        }
+        # No LR scheduling for Stage 2: ReduceLROnPlateau is inappropriate here because
+        # (a) source CE is already optimal from Stage 1 — it never improves, so patience
+        #     fires immediately and kills the LR within the first few epochs, and
+        # (b) the adversarial objective is non-monotonic by design — scheduling on it
+        #     causes premature decay during normal GRL warm-up oscillations.
+        # Fixed LR throughout Stage 2 is the correct approach.
+        return {"optimizer": optimizer}
     
     def optimizer_step(
         self, epoch, batch_idx, optimizer, optimizer_idx, optimizer_closure,

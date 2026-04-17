@@ -468,29 +468,23 @@ class BrepSeg(pl.LightningModule):
     #         }
 
     def configure_optimizers(self):
-        encoder_params = [p for p in self.brep_encoder.parameters() if p.requires_grad]
-        attention_params = [p for p in self.attention.parameters() if p.requires_grad]
-        classifier_params = [p for p in self.classifier.parameters() if p.requires_grad]
-
         optimizer = torch.optim.AdamW(
-            [
-                {"params": encoder_params, "lr": 1e-4},
-                {"params": attention_params, "lr": 3e-4},
-                {"params": classifier_params, "lr": 5e-4},
-            ],
+            self.parameters(),
+            lr=0.002,
             betas=(0.9, 0.999),
-            weight_decay=1e-2,
+            eps=1e-8,
+            weight_decay=0.01,
         )
 
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode="min",
+            mode='min',
             factor=0.5,
-            patience=15,
+            patience=5,
             threshold=1e-4,
-            threshold_mode="rel",
-            min_lr=1e-5,
-            cooldown=5,
+            threshold_mode='rel',
+            min_lr=1e-6,
+            cooldown=2,
             verbose=False,
         )
 
@@ -503,29 +497,6 @@ class BrepSeg(pl.LightningModule):
                 "monitor": "eval_loss",
             },
         }
-
-
-    # Gradually increase the learning rate
-    # def optimizer_step(self,
-    #                    epoch,
-    #                    batch_idx,
-    #                    optimizer,
-    #                    optimizer_idx,
-    #                    optimizer_closure,
-    #                    on_tpu,
-    #                    using_native_amp,
-    #                    using_lbfgs,
-    #                    ):
-    #     # update params
-    #     optimizer.step(closure=optimizer_closure)
-
-    #     # manually warm up lr without a scheduler
-    #     if self.trainer.global_step < 5000:
-    #         lr_scale = min(1.0, float(self.trainer.global_step + 1) / 5000.0)
-    #         for pg in optimizer.param_groups:
-    #             # pg["lr"] = lr_scale * 0.002
-    #             pg["lr"] = lr_scale * 0.001
-
 
     def optimizer_step(
         self,
@@ -540,9 +511,8 @@ class BrepSeg(pl.LightningModule):
     ):
         optimizer.step(closure=optimizer_closure)
 
+        # Warmup: linearly ramp LR from 0 → 0.002 over first 5000 steps
         if self.trainer.global_step < 5000:
             lr_scale = min(1.0, float(self.trainer.global_step + 1) / 5000.0)
-            base_lrs = [1e-4, 3e-4, 5e-4]
-
-            for pg, base_lr in zip(optimizer.param_groups, base_lrs):
-                pg["lr"] = lr_scale * base_lr
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr_scale * 0.002
