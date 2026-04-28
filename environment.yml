@@ -17,22 +17,22 @@
 #       - numpy<2.0.0
 
 
-name: brep_mfr_new
-channels:
-  - conda-forge
-  - defaults
-dependencies:
-  - python=3.10
-  - pip
-  - pip:
-      - --extra-index-url https://download.pytorch.org
-      - torch --pre
-      - torchvision --pre
-      - torchaudio --pre
-      - dgl -f https://data.dgl.ai
-      - torch-geometric
-      - pytorch-lightning
-      - numpy<2.0.0
+# name: brep_mfr_new
+# channels:
+#   - conda-forge
+#   - defaults
+# dependencies:
+#   - python=3.10
+#   - pip
+#   - pip:
+#       - --extra-index-url https://download.pytorch.org
+#       - torch --pre
+#       - torchvision --pre
+#       - torchaudio --pre
+#       - dgl -f https://data.dgl.ai
+#       - torch-geometric
+#       - pytorch-lightning
+#       - numpy<2.0.0
 
 
 # working environment file for brep_mfr project
@@ -49,8 +49,34 @@ dependencies:
 #   - pytorch-cuda=11.7
 #   - dgl=1.0.0
 #   - pip=23.3.1
+#   - numpy==1.23.5
 #   - pip:
 #       - pytorch-lightning==1.7.1
 #       - torch-geometric==2.3.1
-#       - numpy==1.23.5
+      
 
+name: brep_mfr
+channels:
+  - pytorch
+  - nvidia
+  - dglteam/label/cu117
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - torchaudio=0.13.1
+  - pytorch-cuda=11.7
+  - dgl=1.0.0
+  - numpy=1.23.5
+  - pip=23.3.1
+  - pip:
+      - fairseq==0.12.2
+      - pytorch-lightning==1.7.1
+      - torch-geometric==2.3.1
+      - torchmetrics==0.8.0
+      - tensorboardX
+      - six
+      - prefetch_generator
+      - prettytable

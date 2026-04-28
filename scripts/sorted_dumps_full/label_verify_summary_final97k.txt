@@ -1,0 +1,43 @@
+=== face-label verification (multiset comparison) ===
+  ours dir            : Z:\Experiment6\source_dataset\output\bin
+  authors dir         : Z:\authors_data\bin
+  common stems        : 97796
+  match               :   60109   61.46%
+  mismatch            :   37681   38.53%
+  topology size diff  :       6    0.01%
+  missing 'f' tensor  :       0    0.00%
+  errors              :       0    0.00%
+  only-in-ours        : 1
+  only-in-authors     : 2203
+
+=== per-label deltas across mismatched files ===
+lbl  name                                    ours_total  auth_total   delta(O-A)  files_shifted
+----------------------------------------------------------------------------------------------------
+  0  Stock                                       706857      643929       +62928          37678
+  1  Rectangular through slot                     26486       31519        -5033           2732
+  2  Triangular through slot                       8945       11169        -2224           1307
+  3  Rectangular passage                          28253       29881        -1628            863
+  4  Triangular passage                           21319       22701        -1382            785
+  5  6-sided passage                              42946       44457        -1511            782
+  6  Rectangular through step                      8922       10285        -1363           1239
+  7  2-sided through step                         15100       20390        -5290           4045
+  8  Slanted through step                          9211       13593        -4382           3935
+  9  Rectangular blind step                       13269       15237        -1968           1714
+ 10  Triangular blind step                         8882       18757        -9875           8556
+ 11  Rectangular blind slot                       34648       38700        -4052           2396
+ 12  Rectangular pocket                           26523       28835        -2312           2206
+ 13  Triangular pocket                            28212       37664        -9452           8621
+ 14  6-sided pocket                               47149       52611        -5462           5177
+ 15  Chamfer                                      11123       11526         -403            393
+ 16  Circular through slot                         4669        5146         -477            423
+ 17  Through hole                                  6965        7110         -145            122
+ 18  Circular blind step                           9121       11876        -2755           2620
+ 19  Horizontal circular end blind slot           18154       18962         -808            638
+ 20  Vertical circular end blind slot             17360       19105        -1745           1104
+ 21  Circular end pocket                          23642       24260         -618            613
+ 22  O-ring                                       13542       13542           +0              0
+ 23  Blind hole                                    9235        9236           -1              1
+ 24  Round                                        11590       11632          -42             46
+
+file list  : C:\Users\D58\Desktop\BrepMFR\scripts\sorted_dumps_full\label_verify_mismatches_final97k.txt
+per-file   : C:\Users\D58\Desktop\BrepMFR\scripts\sorted_dumps_full\label_verify_mismatches_final97k.csv

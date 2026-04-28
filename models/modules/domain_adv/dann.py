@@ -65,6 +65,9 @@ class DomainAdversarialLoss(nn.Module):
 
     def forward(self, f_s: torch.Tensor, f_t: torch.Tensor,
                 w_s: Optional[torch.Tensor] = None, w_t: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Paper expects callers to zero-pad f_s and f_t to the same size and
+        # provide w_s/w_t masks (1 for real rows, 0 for padded rows). d.chunk(2)
+        # then gives equal halves for the source and target branches.
         f = self.grl(torch.cat((f_s, f_t), dim=0))
         d = self.domain_discriminator(f)
         d_s, d_t = d.chunk(2, dim=0)

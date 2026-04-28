@@ -168,3 +168,28 @@ fairseq/
 *.ipynb
 .vscode/
 .markdowns/
+
+# Cursor IDE local state
+.cursor/
+
+# Local PowerShell helper scripts (not part of the project)
+scripts/_*.ps1
+
+# Large CSV data dumps from validation/auditing scripts.
+# These can be tens of GB and exceed GitHub's per-file size limit.
+# Keep the small *.txt summaries and *.py scripts; regenerate the CSVs locally if needed.
+scripts/sorted_dumps_full/auth_faces.csv
+scripts/sorted_dumps_full/auth_edges.csv
+scripts/sorted_dumps_full/auth_pairs.csv
+scripts/sorted_dumps_full/ours_faces.csv
+scripts/sorted_dumps_full/ours_edges.csv
+scripts/sorted_dumps_full/ours_pairs.csv
+scripts/sorted_dumps/auth_faces.csv
+scripts/sorted_dumps/auth_edges.csv
+scripts/sorted_dumps/auth_pairs.csv
+scripts/sorted_dumps/ours_faces.csv
+scripts/sorted_dumps/ours_edges.csv
+scripts/sorted_dumps/ours_pairs.csv
+
+# 16 MB validation report (regeneratable from script)
+scripts/cadsynth_validation_report_1k.json

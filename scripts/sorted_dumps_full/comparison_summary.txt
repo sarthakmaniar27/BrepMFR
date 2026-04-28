@@ -1,0 +1,120 @@
+========================================================================================================================
+  SORTED CSV COMPARISON — OURS vs AUTHORS  (all row-aligned via deterministic sort)
+  Sort keys: faces = (face_area -> uv_avg -> face_adj -> face_loop)
+             edges = (edge_length -> uv_avg -> edge_conv -> edge_type)
+========================================================================================================================
+
+------------------------------------------------------------------------------------------------------------------------
+  FACES  —  total rows: 2,792,418  files: 99,848
+------------------------------------------------------------------------------------------------------------------------
+  Discrete column          agree   agree_pct  uniq_ours  uniq_auth   ours_top5                          auth_top5
+  face_type            2,375,278      85.06%          6          6   0:2499098, 1:265819, 3:11480, 2:11105, 6:37560:2499096, 1:258040, 5:12681, 2:10717, 3:10687
+  face_loop            2,371,788      84.94%          7          7   1:2496193, 2:279898, 3:15358, 4:918, 5:471:2500785, 2:275718, 3:14981, 4:887, 5:43
+  face_adj             1,283,382      45.96%         36         36   4:1518548, 6:224140, 5:206106, 3:163300, 8:1603914:1518543, 6:225572, 5:204841, 3:162588, 8:160517
+  face_label           1,281,618      45.90%         25         25   0:1636601, 5:126572, 11:100964, 14:90961, 3:872480:1549107, 5:128183, 11:106439, 14:99001, 3:88938
+
+  Continuous column      within_1e-5           MAE          RMSE     max_abs_err   range_ours              range_auth
+  face_area                   22.71%         0.308        0.6067           12.55   [    0.000,   12.566]  [    0.000,   12.566]
+
+  UV per-channel MAE and max_abs_err (aggregated across sorted rows)
+    channel                             MAE     max_abs_err
+    face_uv_mean_ch0                 0.3355               2
+    face_uv_mean_ch1                 0.3433               2
+    face_uv_mean_ch2                 0.3128               2
+    face_uv_mean_ch3                 0.4972               2
+    face_uv_mean_ch4                    0.5               2
+    face_uv_mean_ch5                  0.513               2
+    face_uv_mean_ch6                  0.154               1
+    face_uv_std_ch0                  0.1071          0.7517
+    face_uv_std_ch1                  0.1074           0.734
+    face_uv_std_ch2                  0.0714          0.7071
+    face_uv_std_ch3                 0.06408          0.7905
+    face_uv_std_ch4                 0.06204          0.8068
+    face_uv_std_ch5                 0.04034           0.906
+    face_uv_std_ch6                  0.1696          0.4996
+    face_uv_min_ch0                  0.3905           2.307
+    face_uv_min_ch1                  0.3914           2.289
+    face_uv_min_ch2                  0.3384           2.255
+    face_uv_min_ch3                  0.5426               2
+    face_uv_min_ch4                  0.5411               2
+    face_uv_min_ch5                  0.5394               2
+    face_uv_min_ch6                  0.3935               1
+    face_uv_max_ch0                  0.3758            2.53
+    face_uv_max_ch1                   0.388           2.445
+    face_uv_max_ch2                  0.3367           2.758
+    face_uv_max_ch3                  0.5374               2
+    face_uv_max_ch4                  0.5375               2
+    face_uv_max_ch5                  0.5334               2
+    face_uv_max_ch6                0.004075               1
+
+------------------------------------------------------------------------------------------------------------------------
+  EDGES  —  total rows: 13,984,240  files: 99,848
+------------------------------------------------------------------------------------------------------------------------
+  Discrete column          agree   agree_pct  uniq_ours  uniq_auth   ours_top5                          auth_top5
+  edge_type           11,628,065      83.15%          4          5   0:12575894, 1:1312426, 5:49696, 2:462240:12313010, 1:1223054, 5:392538, 2:29766, 3:25872
+  edge_conv            8,700,300      62.22%          3          3   1:9690362, 2:3927372, 0:366506      1:9691480, 2:3928282, 0:364478
+
+  Continuous column      within_1e-5           MAE          RMSE     max_abs_err   range_ours              range_auth
+  edge_length                 21.00%        0.2921        0.6074           6.963   [    0.000,    6.971]  [    0.000,    6.971]
+  edge_dihedral               49.98%         1.264         1.965           6.283   [   -3.142,    3.142]  [   -3.142,    3.142]
+
+  UV per-channel MAE and max_abs_err (aggregated across sorted rows)
+    channel                             MAE     max_abs_err
+    edge_uv_mean_ch0                 0.3972               2
+    edge_uv_mean_ch1                 0.3974               2
+    edge_uv_mean_ch2                 0.3318               2
+    edge_uv_mean_ch3                 0.5112           60.33
+    edge_uv_mean_ch4                 0.5319           59.78
+    edge_uv_mean_ch5                 0.5005           101.4
+    edge_uv_mean_ch6                  1.267           6.283
+    edge_uv_std_ch0                 0.05225          0.7782
+    edge_uv_std_ch1                 0.05144          0.7784
+    edge_uv_std_ch2                 0.03345          0.7802
+    edge_uv_std_ch3                0.007748           2.654
+    edge_uv_std_ch4                 0.04011           2.347
+    edge_uv_std_ch5                  0.0228           2.838
+    edge_uv_std_ch6               0.0007879           2.515
+    edge_uv_min_ch0                  0.4138               2
+    edge_uv_min_ch1                  0.4123               2
+    edge_uv_min_ch2                  0.3407               2
+    edge_uv_min_ch3                   0.516           60.36
+    edge_uv_min_ch4                  0.5589           59.88
+    edge_uv_min_ch5                  0.5147           101.5
+    edge_uv_min_ch6                   1.267           6.283
+    edge_uv_max_ch0                  0.4119               2
+    edge_uv_max_ch1                  0.4114               2
+    edge_uv_max_ch2                  0.3394               2
+    edge_uv_max_ch3                  0.5159           60.31
+    edge_uv_max_ch4                  0.5541           59.68
+    edge_uv_max_ch5                   0.512           101.3
+    edge_uv_max_ch6                   1.266           6.283
+
+------------------------------------------------------------------------------------------------------------------------
+  PAIRS (A1 spatial_pos / A2 d2 / A3 angle)  —  total rows: 86,440,622  files: 99,848
+------------------------------------------------------------------------------------------------------------------------
+  Discrete column          agree   agree_pct  uniq_ours  uniq_auth   ours_top5                          auth_top5
+  spatial_pos         35,405,297      40.96%         19         19   2:29196638, 3:24048765, 1:13984143, 4:10786282, 5:36568142:29197018, 3:24048626, 1:13984304, 4:10786074, 5:3656700
+  d2_argmax            1,237,324       1.43%         64         58   63:49636617, 0:2814322, 23:815460, 22:809315, 24:8091468:3926882, 9:3920686, 7:3886980, 10:3868664, 11:3786068
+  d2_nz                1,891,707       2.19%         65         50   1:11571727, 0:2792408, 15:1414094, 16:1400540, 17:13898266:4520224, 5:4518056, 7:4450470, 8:4333642, 4:4316106
+  ang_argmax           1,522,537       1.76%         33         42   47:5332294, 35:5245199, 36:5191005, 48:5049520, 37:50482590:35016917, 1:25093994, 2:11234583, 3:5946178, 4:3412442
+  ang_nz               2,614,266       3.02%         33         65   32:16520041, 31:14234203, 30:6620781, 29:5856515, 28:41562610:2792418, 8:2534244, 7:2527528, 9:2521081, 6:2512860
+  edges_path_nonzero  56,270,415      65.10%         16         17   5:23688477, 6:21784601, 4:13262684, 7:11803299, 8:73224615:23603188, 6:21522215, 4:13457181, 7:11720433, 8:7257074
+
+  Continuous column      within_1e-5           MAE          RMSE     max_abs_err   range_ours              range_auth
+  d2_sum                      95.18%        0.0482        0.2195               1   [    0.000,    1.000]  [    0.000,    1.000]
+  d2_mean                     95.18%     0.0007531       0.00343         0.01562   [    0.000,    0.016]  [    0.000,    0.016]
+  d2_std                       0.93%       0.03606       0.04589           0.124   [    0.000,    0.124]  [    0.000,    0.124]
+  ang_sum                     95.18%        0.0482        0.2195               1   [    0.000,    1.000]  [    0.000,    1.000]
+  ang_mean                    95.18%     0.0007531       0.00343         0.01562   [    0.000,    0.016]  [    0.000,    0.016]
+  ang_std                      0.86%       0.02056       0.02757           0.124   [    0.000,    0.124]  [    0.000,    0.124]
+========================================================================================================================
+  NOTES
+========================================================================================================================
+  - 'agree' / 'agree_pct' compares row-i of OURS to row-i of AUTHORS AFTER the deterministic sort.
+  - Large UV MAE reflects that SolidWorks and OpenCascade sample UV points at different parametric
+    locations; this is expected. What matters is whether face_label, face_type, edge_type and edge_conv
+    agree — those are pipeline decisions unrelated to sampling.
+  - For face_area and edge_length, MAE should be close to zero if the same geometry is being read;
+    a non-zero MAE means the sort keys (area / length) are NOT aligning identical geometric entities,
+    which could indicate that our macro is emitting a different set of edges / faces.
+========================================================================================================================

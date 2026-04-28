@@ -1,0 +1,55 @@
+==================== FILE: 00057053 ====================
+  ours path : Z:\Experiment6\source_dataset\output\bin\00057053_101.bin
+  auth path : Z:\authors_data\bin\00057053.bin
+  ours: n_faces=10  n_edges=20
+  auth: n_faces=10  n_edges=20
+
+=== FACES (sorted by face_area -> uv_avg -> face_adj -> face_loop) ===
+   i |   OURS    area  typ lop adj lbl label_name                           |   AUTH    area  typ lop adj lbl label_name                           | DIFF
+  -------------------------------------------------------------------------------------------------------------------------------------------------------
+   0 |        0.23875    0   2   2   0 Stock                                |        0.23875    0   2   2   0 Stock                                | MATCH
+   1 |        0.56872    0   2   2   0 Stock                                |        0.56872    0   2   2   0 Stock                                | MATCH
+   2 |        0.71692    0   2   2   0 Stock                                |        0.71692    0   2   2   0 Stock                                | MATCH
+   3 |        0.98155    0   2   2   0 Stock                                |        0.98155    0   2   2   0 Stock                                | MATCH
+   4 |        1.16359    1   1   3   0 Stock                                |        1.16359    1   1   3   0 Stock                                | MATCH
+   5 |        1.22236    1   1   3   0 Stock                                |        1.22236    1   1   3   0 Stock                                | MATCH
+   6 |        1.36850    0   2   2   0 Stock                                |        1.36850    0   2   2   0 Stock                                | MATCH
+   7 |        1.60585    1   1   3   0 Stock                                |        1.60585    1   1   3   0 Stock                                | MATCH
+   8 |        1.73889    1   1   3   0 Stock                                |        1.73889    1   1   3   0 Stock                                | MATCH
+   9 |        3.09284    1   1   3  17 Through hole                         |        3.09284    1   1   3  17 Through hole                         | MATCH
+
+  face mismatches on sort-aligned rows: 0 / 10
+
+=== EDGES (sorted by edge_length -> uv_avg -> edge_conv -> edge_type) ===
+    i |  OURS     length  typ  cnv     dihed |  AUTH     length  typ  cnv     dihed | DIFF
+  ----------------------------------------------------------------------------------------
+    0 |          1.54642    1    1   +1.5708 |          1.54642    1    1   +1.5708 | MATCH
+    1 |          1.54642    1    1   +1.5708 |          1.54642    1    1   +1.5708 | MATCH
+    2 |          1.54642    1    1   +1.5708 |          1.54642    1    1   +1.5708 | MATCH
+    3 |          1.54642    1    1   +1.5708 |          1.54642    1    1   +1.5708 | MATCH
+    4 |          2.06246    1    2   -1.5708 |          2.06246    1    2   -1.5708 | MATCH
+    5 |          2.06246    1    2   -1.5708 |          2.06246    1    2   -1.5708 | MATCH
+    6 |          2.06246    1    2   -1.5708 |          2.06246    1    2   -1.5708 | MATCH
+    7 |          2.06246    1    2   -1.5708 |          2.06246    1    2   -1.5708 | MATCH
+    8 |          2.69331    1    2   -1.5708 |          2.69331    1    2   -1.5708 | MATCH
+    9 |          2.69331    1    2   -1.5708 |          2.69331    1    2   -1.5708 | MATCH
+   10 |          2.69331    1    1   +1.5708 |          2.69331    1    1   +1.5708 | MATCH
+   11 |          2.69331    1    1   +1.5708 |          2.69331    1    1   +1.5708 | MATCH
+   12 |          3.37646    1    1   +1.5708 |          3.37646    1    1   +1.5708 | MATCH
+   13 |          3.37646    1    1   +1.5708 |          3.37646    1    1   +1.5708 | MATCH
+   14 |          3.37646    1    1   +1.5708 |          3.37646    1    1   +1.5708 | MATCH
+   15 |          3.37646    1    1   +1.5708 |          3.37646    1    1   +1.5708 | MATCH
+   16 |          4.42589    1    1   +1.5708 |          4.42589    1    1   +1.5708 | MATCH
+   17 |          4.42589    1    1   +1.5708 |          4.42589    1    1   +1.5708 | MATCH
+   18 |          4.42589    1    1   +1.5708 |          4.42589    1    1   +1.5708 | MATCH
+   19 |          4.42589    1    1   +1.5708 |          4.42589    1    1   +1.5708 | MATCH
+
+  edge mismatches on sort-aligned rows: 0 / 20
+
+=== AGGREGATE (multisets, order-independent) ===
+  face_type   ours: {0:5, 1:5}  auth: {0:5, 1:5}
+  face_loop   ours: {1:5, 2:5}  auth: {1:5, 2:5}
+  face_adj    ours: {2:5, 3:5}  auth: {2:5, 3:5}
+  face_label  ours: {0:9, 17:1}  auth: {0:9, 17:1}
+  edge_type   ours: {1:20}  auth: {1:20}
+  edge_conv   ours: {1:14, 2:6}  auth: {1:14, 2:6}
