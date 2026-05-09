@@ -22,9 +22,9 @@ Outputs (to --out-dir, default same as --dir):
     worst_files_full.csv       per-file stats for every file (for your own drill-down)
 
 Usage:
-    python scripts/summarize_sorted_csvs.py
-    python scripts/summarize_sorted_csvs.py --dir scripts/sorted_dumps
-    python scripts/summarize_sorted_csvs.py --topk 50
+    python scripts/dataset_utils/summarize_sorted_csvs.py
+    python scripts/dataset_utils/summarize_sorted_csvs.py --dir scripts/sorted_dumps
+    python scripts/dataset_utils/summarize_sorted_csvs.py --topk 50
 """
 from __future__ import annotations
 

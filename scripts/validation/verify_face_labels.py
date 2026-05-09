@@ -16,9 +16,9 @@ Outputs (under scripts/sorted_dumps_full/):
         Per-file label deltas (ours vs authors) for each mismatched stem.
 
 Usage:
-    python scripts/verify_face_labels.py
-    python scripts/verify_face_labels.py --workers 10
-    python scripts/verify_face_labels.py --limit 1000   # debug
+    python scripts/validation/verify_face_labels.py
+    python scripts/validation/verify_face_labels.py --workers 10
+    python scripts/validation/verify_face_labels.py --limit 1000   # debug
 """
 from __future__ import annotations
 

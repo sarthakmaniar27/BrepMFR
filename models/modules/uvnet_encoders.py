@@ -1,3 +1,5 @@
+# Legacy UVNet stubs (authors' graph conv path). Not imported by segmentation / BrepSeg; requires
+# optional ``dgl`` which is deliberately omitted from ``environment_pyg.yml``.
 import torch
 from torch import nn
 import torch.nn.functional as F

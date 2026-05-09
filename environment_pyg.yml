@@ -1,0 +1,31 @@
+# PyTorch 2.7 + CUDA 12.8 + PyG (Blackwell sm_120 path). Create with:
+#   conda env create -f environment_pyg.yml
+# Then install PyG extensions (match your torch+cu128 build):
+#   pip install pyg-lib torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+#   pip install torch-geometric==2.7.0
+#
+# Ingest workflow: SolidWorks macro JSON → .pt (+ labels) with `scripts/inference/json_to_brepmfr_pyg.py` (no DGL).
+# Optional one-time legacy corpus: migrate old .bin → .pt with `scripts/inference/convert_dgl_bins_to_pyg.py`
+# using a conda env where `dgl` matches how those .bin files were written.
+
+name: brep_mfr_pyg
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+    # PyPI is default; PyTorch cu128 wheels come from the extra index (do not use --index-url alone).
+    - --extra-index-url https://download.pytorch.org/whl/cu128
+    - torch==2.7.0+cu128
+    - torchvision
+    - torchaudio
+    - pytorch-lightning>=2.4.0,<2.6
+    - torchmetrics>=1.0.0
+    - tensorboardX
+    - six
+    - scipy
+    - prefetch_generator
+    - prettytable
+    - tqdm
+    - "numpy>=1.23,<2"

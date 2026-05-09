@@ -2,9 +2,7 @@ import math
 from typing import Optional, Tuple
 
 import torch
-from fairseq import utils
-from fairseq.modules.fairseq_dropout import FairseqDropout
-from fairseq.modules.quant_noise import quant_noise
+from ..utils.fairseq_shim import FairseqDropout, quant_noise, softmax
 from torch import Tensor, nn
 
 
@@ -189,7 +187,7 @@ class MultiheadAttention(nn.Module):
         if before_softmax:
             return attn_weights, v
 
-        attn_weights_float = utils.softmax(
+        attn_weights_float = softmax(
             attn_weights, dim=-1, onnx_trace=self.onnx_trace
         )
         attn_weights = attn_weights_float.type_as(attn_weights)

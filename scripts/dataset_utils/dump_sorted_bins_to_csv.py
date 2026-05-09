@@ -41,19 +41,19 @@ Why this layout makes comparison easy:
 
 Usage:
     # default: process first 100 file stems that exist in both datasets
-    python scripts/dump_sorted_bins_to_csv.py
+    python scripts/dataset_utils/dump_sorted_bins_to_csv.py
 
     # process a specific number, with stratified sampling for good coverage
-    python scripts/dump_sorted_bins_to_csv.py --n 500 --strategy stratified
+    python scripts/dataset_utils/dump_sorted_bins_to_csv.py --n 500 --strategy stratified
 
     # process everything (will produce very large CSVs)
-    python scripts/dump_sorted_bins_to_csv.py --all
+    python scripts/dataset_utils/dump_sorted_bins_to_csv.py --all
 
     # only ours (no authors)
-    python scripts/dump_sorted_bins_to_csv.py --sides ours
+    python scripts/dataset_utils/dump_sorted_bins_to_csv.py --sides ours
 
     # custom output folder
-    python scripts/dump_sorted_bins_to_csv.py --out-dir scripts/sorted_dumps
+    python scripts/dataset_utils/dump_sorted_bins_to_csv.py --out-dir scripts/sorted_dumps
 """
 from __future__ import annotations
 
@@ -559,7 +559,7 @@ def main() -> int:
     ap.add_argument("--all", action="store_true", help="Process ALL common stems (overrides --n)")
     ap.add_argument("--strategy", choices=["head", "random", "stratified"], default="stratified")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--out-dir", default=str(Path(__file__).parent / "sorted_dumps"))
+    ap.add_argument("--out-dir", default=str(Path(__file__).resolve().parents[2] / "sorted_dumps"))
     ap.add_argument("--sides", nargs="+", choices=["ours", "auth"], default=["ours", "auth"])
     ap.add_argument("--no-pairs", action="store_true", help="Skip A1/A2/A3 pair CSV (faster, smaller)")
     ap.add_argument("--progress-every", type=int, default=10)

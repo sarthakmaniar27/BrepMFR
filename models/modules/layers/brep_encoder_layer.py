@@ -3,10 +3,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from fairseq import utils
-from fairseq.modules import LayerNorm
-from fairseq.modules.fairseq_dropout import FairseqDropout
-from fairseq.modules.quant_noise import quant_noise
+from ..utils.fairseq_shim import (
+    FairseqDropout,
+    LayerNorm,
+    quant_noise,
+    get_activation_fn,
+)
 from .multihead_attention import MultiheadAttention
 from .feature_encoders import SurfaceEncoder, CurveEncoder
 
@@ -47,7 +49,7 @@ class GraphEncoderLayer(nn.Module):
         )
 
         # Initialize blocks
-        self.activation_fn = utils.get_activation_fn(activation_fn)
+        self.activation_fn = get_activation_fn(activation_fn)
         self.self_attn = self.build_self_attention(
             self.embedding_dim,
             num_attention_heads,
@@ -306,8 +308,8 @@ class _EdgeConv(nn.Module):
         self.batchnorm = nn.BatchNorm1d(out_feats)
         self.eps = torch.nn.Parameter(torch.FloatTensor([0.0]))
 
-    def forward(self, graph, nfeat, efeat):
-        src, dst = graph.edges()
+    def forward(self, edge_index, nfeat, efeat):
+        src, dst = edge_index[0], edge_index[1]
         proj1, proj2 = self.proj(nfeat[src]), self.proj(nfeat[dst])
         agg = proj1 + proj2
         h = self.mlp((1 + self.eps) * efeat + agg)
@@ -361,7 +363,7 @@ class GraphAttnBias(nn.Module):
 
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
-    def forward(self, attn_bias, spatial_pos, d2_distance, ang_distance, edge_data, edge_type, edge_len, edge_ang, edge_conv, edge_path, edge_padding_mask, graph, node_feat):
+    def forward(self, attn_bias, spatial_pos, d2_distance, ang_distance, edge_data, edge_type, edge_len, edge_ang, edge_conv, edge_path, edge_padding_mask, edge_index, node_feat):
         n_graph, n_node = edge_path.size()[:2]
 
         graph_attn_bias = attn_bias.clone()
@@ -543,7 +545,7 @@ class GraphAttnBias(nn.Module):
             edge_feat = edge_data_ + edge_type_ + edge_len_ + edge_ang_ + edge_conv_
 
             # add node_feature to edge_feature
-            edge_feat_ = self.node_cat(graph, node_feat, edge_feat)  # [total_edges, n_head]
+            edge_feat_ = self.node_cat(edge_index, node_feat, edge_feat)  # [total_edges, n_head]
 
             # Edge input expansion [total_edges, n_head]->[n_graph, max_node_num, max_node_num, max_dist, n_head]
             n_edge = edge_padding_mask.size(1)

@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SolidWorks macro JSON → ``torch_geometric.data.Data``, saved as ``.pt`` (+ optional label JSON).
+
+**Migration parity with the old three-step toolchain**
+
+1. ``BrepMFR/json_to_brepmfr_bin.py`` (JSON → DGL ``.bin`` + labels): face order, edges, flipping,
+   scalar ``edge_ang`` wrap, ``spatial_pos`` / ``edge_path``, ``face_pairs`` → A2 tensors.
+2. ``BrepMFR/append_angle_7th_channel.py``: wrap edge UV-grid channel 7 (index 6) to
+   :math:`[-\\pi, \\pi)` in place on ``edata['x']``.
+3. ``convert_dgl_bins_to_pyg`` / ``bin_to_pyg``: ``.bin`` → ``.pt``.
+
+This script merges (1)+(2)+(3)'s numeric result in one PyTorch-only path: every ``.pt`` is written
+like **post-``append_angle``** graphs. You do **not** run ``append_angle_7th_channel`` anymore.
+
+Dataset loading (``CADSynth``, ``TransferDataset``): ``torch.load(...)`` unchanged. **No DGL**
+required on this ingest path.
+
+**Pairing discipline (targets):** under ``Experiment6/target_dataset/input`` multiple ``json_*\\``
+trees can share one filename with different ``face[].label``; use the subtree that matches your
+``.pt`` / training labels.
+
+**Roots:** ``Z:\\Experiment6`` / ``Z:\\Experiment6_PyG`` are historical corpora; ``Z:\\Experiment_test``
+holds writable copies for optional JSON-vs-``.bin`` parity (parity tooling may still ``import dgl``
+to load old ``.bin`` files only).
+
+Example:
+  conda activate brep_mfr_pyg
+  python scripts/inference/json_to_brepmfr_pyg.py \\
+    --json_dir Z:/Experiment_test/input_json \\
+    --pt_out_dir Z:/Experiment_test/out_pyg \\
+    --label_out_dir Z:/Experiment_test/out_label
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+import traceback
+from collections import deque, defaultdict
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+from torch import FloatTensor
+from torch_geometric.data import Data as PYGGraph
+from tqdm import tqdm
+
+
+def _reshape_face_uv(flat_uv: list, U: int = 5, V: int = 5, C: int = 7) -> np.ndarray:
+    """Reshapes flat face list to (U, V, 7) grid: [x, y, z, nx, ny, nz, mask]."""
+    arr = np.asarray(flat_uv, dtype=np.float32)
+    return arr.reshape(U, V, C)
+
+
+def _reshape_edge_pt(flat_pt: list, U: int = 5, C: int = 7) -> np.ndarray:
+    """Reshapes flat edge list to (U, 7) grid: [x, y, z, tx, ty, tz, angle]."""
+    arr = np.asarray(flat_pt, dtype=np.float32)
+    return arr.reshape(U, C)
+
+
+def _wrap_edge_uv_angle_ch7(edge_x: np.ndarray) -> None:
+    """
+    In-place wrap of channel index 6 (7th UV sample feature) on every directed edge arc.
+
+    Equivalent to ``BrepMFR/append_angle_7th_channel.wrap_to_pi_tensor`` on ``edata['x'][:, :, 6]``.
+    Applied unconditionally so JSON→``.pt`` matches the legacy workflow **after** that script.
+    """
+    pi = np.float32(math.pi)
+    two_pi = np.float32(2.0 * math.pi)
+    edge_x[:, :, 6] = (edge_x[:, :, 6] + pi) % two_pi - pi
+
+
+def _compute_shortest_paths_edge_indices(src_nodes, dst_nodes, num_nodes, max_dist=16):
+    """
+    Computes A1 (Shortest path distance) and A3 (Chain of edge indices).
+    Matches Graphormer-style encoding where edges_path stores the sequence of edge IDs.
+    """
+    adj = [[] for _ in range(num_nodes)]
+    for ei, (u, v) in enumerate(zip(src_nodes, dst_nodes)):
+        adj[u].append((v, ei))
+
+    spatial_pos = torch.full((num_nodes, num_nodes), fill_value=10**9, dtype=torch.int32)
+    edges_path = torch.full((num_nodes, num_nodes, max_dist), fill_value=-1, dtype=torch.int32)
+
+    for s in range(num_nodes):
+        spatial_pos[s, s] = 0
+        dist = [-1] * num_nodes
+        prev_node = [-1] * num_nodes
+        prev_edge = [-1] * num_nodes
+        q = deque([s])
+        dist[s] = 0
+
+        while q:
+            u = q.popleft()
+            for v, ei in adj[u]:
+                if dist[v] == -1:
+                    dist[v] = dist[u] + 1
+                    prev_node[v] = u
+                    prev_edge[v] = ei
+                    q.append(v)
+
+        for t in range(num_nodes):
+            if dist[t] == -1:
+                continue
+            spatial_pos[s, t] = dist[t]
+            if t == s:
+                continue
+
+            path_edges = []
+            cur = t
+            while cur != s and cur != -1:
+                path_edges.append(prev_edge[cur])
+                cur = prev_node[cur]
+            path_edges.reverse()
+
+            for k in range(min(len(path_edges), max_dist)):
+                edges_path[s, t, k] = int(path_edges[k])
+
+    return spatial_pos, edges_path
+
+
+def _build_a2_tensors(data: dict, face_id_to_node: dict, N: int) -> tuple:
+    """
+    Builds d2_distance and angle_distance tensors from face_pairs in JSON.
+
+    Design A:
+    - Exactly one JSON entry per unordered face pair
+    - entry["a3"]   = histogram for face_pair[0] -> face_pair[1]
+    - entry["a3_1"] = histogram for face_pair[1] -> face_pair[0]
+
+    D2 is symmetric.
+    A3 is asymmetric.
+    """
+    d2_distance = torch.zeros((N, N, 64), dtype=torch.float32)
+    angle_distance = torch.zeros((N, N, 64), dtype=torch.float32)
+
+    face_pairs = data.get("face_pairs", [])
+    if not face_pairs:
+        return d2_distance, angle_distance
+
+    pair_lut = {}
+    for entry in face_pairs:
+        fi = int(entry["face_pair"][0])
+        fj = int(entry["face_pair"][1])
+
+        if fi == fj:
+            continue
+
+        key = (min(fi, fj), max(fi, fj))
+
+        if key in pair_lut:
+            raise ValueError(
+                f"Duplicate unordered face pair found in JSON for faces {key}. "
+                f"Design A requires exactly one entry per unordered pair."
+            )
+
+        if len(entry["d2"]) != 64:
+            raise ValueError(f"d2 histogram for pair {fi, fj} does not have length 64")
+        if len(entry["a3"]) != 64:
+            raise ValueError(f"a3 histogram for pair {fi, fj} does not have length 64")
+        if len(entry["a3_1"]) != 64:
+            raise ValueError(f"a3_1 histogram for pair {fi, fj} does not have length 64")
+
+        pair_lut[key] = entry
+
+    node_to_face_id = {v: k for k, v in face_id_to_node.items()}
+
+    for ni in range(N):
+        for nj in range(N):
+            if ni == nj:
+                continue
+
+            fi = node_to_face_id[ni]
+            fj = node_to_face_id[nj]
+
+            key = (min(fi, fj), max(fi, fj))
+            entry = pair_lut.get(key)
+            if entry is None:
+                continue
+
+            stored_f0 = int(entry["face_pair"][0])
+            stored_f1 = int(entry["face_pair"][1])
+
+            d2_distance[ni, nj] = torch.tensor(entry["d2"], dtype=torch.float32)
+
+            if fi == stored_f0 and fj == stored_f1:
+                angle_distance[ni, nj] = torch.tensor(entry["a3"], dtype=torch.float32)
+            elif fi == stored_f1 and fj == stored_f0:
+                angle_distance[ni, nj] = torch.tensor(entry["a3_1"], dtype=torch.float32)
+            else:
+                raise RuntimeError(
+                    f"Inconsistent face pair mapping for query ({fi}, {fj}) "
+                    f"against stored pair ({stored_f0}, {stored_f1})"
+                )
+
+    return d2_distance, angle_distance
+
+
+def _write_label_json(label_out_dir: Path, file_stem: str, labels_list: list):
+    label_out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = label_out_dir / f"{file_stem}.json"
+    payload = {"file_name": file_stem, "labels": labels_list}
+    out_path.write_text(json.dumps(payload, indent=3), encoding="utf-8")
+
+
+PYG_ATTRS_ORDER = (
+    "node_data",
+    "edge_data",
+    "face_type",
+    "face_area",
+    "face_loop",
+    "face_adj",
+    "label_feature",
+    "edge_type",
+    "edge_len",
+    "edge_ang",
+    "edge_conv",
+    "node_degree",
+    "attn_bias",
+    "edge_path",
+    "spatial_pos",
+    "d2_distance",
+    "angle_distance",
+    "edge_index",
+    "data_id",
+)
+
+
+def tensors_from_brep_json_dict(
+    data: dict,
+    spatial_pos_max: int = 32,
+) -> tuple[PYGGraph, list[int]]:
+    """
+    Build PyG ``Data`` from decoded macro JSON (**same tensors as** ``json_to_brepmfr_bin`` **then**
+    ``append_angle_7th_channel`` on ``edge_data[..., 6]``).
+    """
+    faces, edges = data["faces"], data["edges"]
+
+    sorted_faces = sorted(faces, key=lambda x: int(x["id"]))
+    face_id_to_node = {int(f["id"]): i for i, f in enumerate(sorted_faces)}
+    node_to_face_id = {v: k for k, v in face_id_to_node.items()}
+    N = len(sorted_faces)
+
+    adj = defaultdict(list)
+    edge_lut = {}
+    for e in edges:
+        f1, f2 = int(e["nf"][0]), int(e["nf"][1])
+        if f1 in face_id_to_node and f2 in face_id_to_node:
+            u, v = face_id_to_node[f1], face_id_to_node[f2]
+            adj[u].append(v)
+            adj[v].append(u)
+            edge_lut[frozenset([f1, f2])] = e
+
+    final_src, final_dst = [], []
+    for i in range(N):
+        for neighbor in sorted(adj[i]):
+            final_src.append(i)
+            final_dst.append(neighbor)
+    E = len(final_src)
+
+    node_x = np.zeros((N, 5, 5, 7), dtype=np.float32)
+    node_z = np.zeros(N, dtype=np.int32)
+    node_l = np.zeros(N, dtype=np.int32)
+    node_a = np.zeros(N, dtype=np.int32)
+    node_f = np.zeros(N, dtype=np.int32)
+    node_y = np.zeros(N, dtype=np.float32)
+
+    labels_list = [0] * N
+
+    for f in sorted_faces:
+        ni = face_id_to_node[int(f["id"])]
+        node_x[ni] = _reshape_face_uv(f["uv"])
+        node_z[ni] = int(f["z"])
+        node_y[ni] = float(f["y"])
+        node_l[ni] = int(f["l"])
+        node_a[ni] = int(f["a"])
+        lbl = int(f.get("label", 0))
+        node_f[ni] = lbl
+        labels_list[ni] = lbl
+
+    edge_x = np.zeros((E, 5, 7), dtype=np.float32)
+    edge_t = np.zeros(E, dtype=np.int32)
+    edge_c = np.zeros(E, dtype=np.int32)
+    edge_l = np.zeros(E, dtype=np.float32)
+    edge_a = np.zeros(E, dtype=np.float32)
+
+    for i, (u_idx, v_idx) in enumerate(zip(final_src, final_dst)):
+        u_fid, v_fid = node_to_face_id[u_idx], node_to_face_id[v_idx]
+        eobj = edge_lut[frozenset([u_fid, v_fid])]
+        raw_pts = _reshape_edge_pt(eobj["pt"])
+        if u_fid == int(eobj["nf"][0]):
+            edge_x[i] = raw_pts
+        else:
+            flipped = np.flip(raw_pts, axis=0).copy()
+            flipped[:, 3:6] *= -1.0
+            edge_x[i] = flipped
+        edge_t[i] = int(eobj["t"])
+        edge_l[i] = float(eobj["l"])
+        edge_c[i] = int(eobj["c"])
+        edge_a[i] = (float(eobj["a"]) + np.pi) % (2 * np.pi) - np.pi
+
+    _wrap_edge_uv_angle_ch7(edge_x)
+
+    spatial_pos, edges_path = _compute_shortest_paths_edge_indices(final_src, final_dst, N)
+    d2_distance, angle_distance = _build_a2_tensors(data, face_id_to_node, N)
+
+    max_p = int(spatial_pos[spatial_pos < 10**8].max().item()) if N > 1 else 0
+    edges_path = edges_path[:, :, :max_p]
+    spatial_pos = spatial_pos.clamp(max=spatial_pos_max)
+
+    edges_path_i = edges_path.int()
+    spatial_pos_i = spatial_pos.int()
+
+    # Match bin_to_pyg: out-degree equals row-sum of directed adjacency (one row per arc u->v)
+    src_counts = torch.bincount(
+        torch.tensor(final_src, dtype=torch.long),
+        minlength=N,
+    )
+    node_degree = src_counts.view(-1)
+
+    pyg = PYGGraph()
+
+    xt = torch.from_numpy(node_x)
+    pyg.node_data = xt.type(FloatTensor)
+
+    pyg.edge_data = torch.from_numpy(edge_x).type(FloatTensor)
+
+    pyg.face_type = torch.from_numpy(node_z).type(torch.int)
+    pyg.face_area = torch.from_numpy(node_y).type(torch.float)
+    pyg.face_loop = torch.from_numpy(node_l).type(torch.int)
+    pyg.face_adj = torch.from_numpy(node_a).type(torch.int)
+    pyg.label_feature = torch.from_numpy(node_f).type(torch.int)
+
+    pyg.edge_type = torch.from_numpy(edge_t).type(torch.int)
+    pyg.edge_len = torch.from_numpy(edge_l).type(torch.float)
+    pyg.edge_ang = torch.from_numpy(edge_a).type(torch.float)
+    pyg.edge_conv = torch.from_numpy(edge_c).type(torch.int)
+
+    pyg.node_degree = node_degree
+    pyg.attn_bias = torch.zeros([N + 1, N + 1], dtype=torch.float)
+
+    pyg.edge_path = edges_path_i
+    pyg.spatial_pos = spatial_pos_i
+    pyg.d2_distance = d2_distance
+    pyg.angle_distance = angle_distance
+
+    ei = torch.stack(
+        [
+            torch.tensor(final_src, dtype=torch.long),
+            torch.tensor(final_dst, dtype=torch.long),
+        ],
+        dim=0,
+    )
+    pyg.edge_index = ei
+
+    return pyg, labels_list
+
+
+def build_pyg_from_json_path(json_path: Path | str, spatial_pos_max: int = 32) -> PYGGraph:
+    """Load one JSON path, set ``data_id`` from stem (fallback 0 like ``data.dgl_bin_to_pyg``)."""
+    json_path = Path(json_path)
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    pyg, _ = tensors_from_brep_json_dict(data, spatial_pos_max=spatial_pos_max)
+    stem = json_path.stem
+    try:
+        pyg.data_id = int(stem.split("_")[-1])
+    except ValueError:
+        pyg.data_id = 0
+    return pyg
+
+
+def convert_one_json(
+    json_path: Path,
+    pt_out_dir: Path,
+    label_out_dir: Optional[Path],
+    spatial_pos_max: int = 32,
+) -> Path:
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    pyg, labels_list = tensors_from_brep_json_dict(data, spatial_pos_max=spatial_pos_max)
+    file_stem = json_path.stem
+    try:
+        pyg.data_id = int(file_stem.split("_")[-1])
+    except ValueError:
+        pyg.data_id = 0
+
+    pt_out_dir.mkdir(parents=True, exist_ok=True)
+    out_pt = pt_out_dir / f"{file_stem}.pt"
+    torch.save(pyg, out_pt)
+
+    if label_out_dir is not None:
+        _write_label_json(label_out_dir, file_stem, labels_list)
+
+    return out_pt
+
+
+def main():
+    parser = argparse.ArgumentParser("Convert SolidWorks JSON → PyG ``.pt`` (+ labels json)")
+    parser.add_argument("--json_dir", type=str, required=True, help="Input folder containing per-model *.json")
+    parser.add_argument("--pt_out_dir", type=str, required=True, help="Output folder for ``.pt`` graphs")
+    parser.add_argument("--label_out_dir", type=str, default=None)
+    parser.add_argument("--spatial_pos_max", type=int, default=32)
+    args = parser.parse_args()
+
+    json_dir = Path(args.json_dir)
+    pt_out_dir = Path(args.pt_out_dir)
+    label_out_dir = Path(args.label_out_dir) if args.label_out_dir else None
+
+    json_files = sorted(json_dir.glob("*.json"))
+    ok = 0
+    skipped = 0
+    failed = 0
+    conversion_times = []
+    wall_start = time.time()
+
+    for jp in tqdm(json_files, desc="Converting", unit="file"):
+        file_stem = jp.stem
+        pt_exists = (pt_out_dir / f"{file_stem}.pt").exists()
+        label_exists = (label_out_dir / f"{file_stem}.json").exists() if label_out_dir else True
+        if pt_exists and label_exists:
+            skipped += 1
+            continue
+        t0 = time.perf_counter()
+        try:
+            convert_one_json(
+                jp,
+                pt_out_dir,
+                label_out_dir,
+                spatial_pos_max=args.spatial_pos_max,
+            )
+            ok += 1
+        except Exception as e:
+            print(f"\n[FAIL] {jp.name}: {e}")
+            traceback.print_exc()
+            failed += 1
+        conversion_times.append(time.perf_counter() - t0)
+
+    wall_total = time.time() - wall_start
+    print(
+        f"\nDone. Converted: {ok} | Skipped (already exist): {skipped} | Failed: {failed} | Total: {len(json_files)}"
+    )
+    if conversion_times:
+        avg_ms = (sum(conversion_times) / len(conversion_times)) * 1000
+        min_ms = min(conversion_times) * 1000
+        max_ms = max(conversion_times) * 1000
+        print(f"Per-file conversion time — avg: {avg_ms:.1f} ms | min: {min_ms:.1f} ms | max: {max_ms:.1f} ms")
+    print(f"Total wall-clock time: {wall_total:.1f} s ({wall_total/60:.2f} min)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from dgl.nn.pytorch.conv import NNConv
-from dgl.nn.pytorch.glob import MaxPooling
 
 def _conv1d(in_channels, out_channels, kernel_size=3, padding=0, bias=False):
     """

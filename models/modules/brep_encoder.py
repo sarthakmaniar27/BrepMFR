@@ -1,8 +1,8 @@
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
-from fairseq.modules import FairseqDropout, LayerDropModuleList, LayerNorm
-from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
+from .utils.fairseq_shim import FairseqDropout, LayerDropModuleList, LayerNorm
+from .utils.fairseq_shim import quant_noise as apply_quant_noise_
 
 from .layers.multihead_attention import MultiheadAttention
 from .layers.brep_encoder_layer import GraphEncoderLayer, GraphNodeFeature, GraphAttnBias
@@ -204,7 +204,7 @@ class BrepEncoder(nn.Module):
                                          batch_data["edge_conv"],
                                          batch_data["edge_path"],
                                          batch_data["edge_padding_mask"],
-                                         batch_data["graph"],
+                                         batch_data["edge_index"],
                                          x_0
                                          )  #attn_bias[n_graph, n_head, max_node_num, max_node_num]
 

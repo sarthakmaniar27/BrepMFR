@@ -5,14 +5,18 @@ import os
 from multiprocessing.pool import Pool
 from itertools import repeat
 
-import dgl
 import numpy as np
 import torch
+
+from occwl_pythonocc_patch import apply_pythonocc_occwl_compatibility
+
+apply_pythonocc_occwl_compatibility()
+from occwl.compound import Compound
 from occwl.graph import face_adjacency
-from occwl.io import load_step
-from occwl.uvgrid import ugrid, uvgrid
 from tqdm import tqdm
 from torch import FloatTensor
+
+from occwl_to_brep_tensors import tensor_dict_from_face_adjacency
 
 # 面类型映射（8种类型）
 FACE_TYPE_MAP = {
@@ -42,257 +46,32 @@ def build_graph(solid, curv_num_u_samples=5, surf_num_u_samples=5, surf_num_v_sa
     返回:
         dgl.DGLGraph: 包含所有特征的DGL图
     """
-    # 构建面邻接图
-    graph = face_adjacency(solid)
-    
-    # 准备面特征列表
-    graph_face_feat = []    # UV网格几何特征 [n, n, 7]
-    face_types = []         # 面类型
-    face_areas = []         # 面面积
-    face_loops = []         # 环数量
-    face_adjs = []          # 相邻面数量
-    
-    # 处理每个面
-    for face_idx in graph.nodes:
-        face = graph.nodes[face_idx]["face"]
-        
-        try:
-            # UV网格采样
-            points = uvgrid(
-                face, method="point", num_u=surf_num_u_samples, num_v=surf_num_v_samples
-            )
-            normals = uvgrid(
-                face, method="normal", num_u=surf_num_u_samples, num_v=surf_num_v_samples
-            )
-            visibility_status = uvgrid(
-                face, method="visibility_status", num_u=surf_num_u_samples, num_v=surf_num_v_samples
-            )
-            
-            # 处理mask维度
-            mask = np.logical_or(visibility_status == 0, visibility_status == 2)
-            
-            # 标准化维度
-            if mask.ndim > 2:
-                mask = mask.squeeze()
-            if mask.ndim == 2:
-                mask = mask.astype(np.float32)[..., np.newaxis]
-            else:
-                mask = mask.reshape(surf_num_u_samples, surf_num_v_samples, 1).astype(np.float32)
-            
-            # 确保所有数组维度一致
-            if points.ndim != 3:
-                points = points.reshape(surf_num_u_samples, surf_num_v_samples, -1)
-            if normals.ndim != 3:
-                normals = normals.reshape(surf_num_u_samples, surf_num_v_samples, -1)
-            
-            # 拼接特征
-            face_feat = np.concatenate((points, normals, mask), axis=-1)
-            
-        except Exception as e:
-            print(f"Error processing face {face_idx}: {str(e)}")
-            # 创建默认特征
-            face_feat = np.zeros((surf_num_u_samples, surf_num_v_samples, 7), dtype=np.float32)
-        
-        graph_face_feat.append(face_feat)
-        
-        # 属性特征提取
-        try:
-            surface_type = str(face.surface_type()).lower()
-            face_type = FACE_TYPE_MAP.get(surface_type, 0)
-        except:
-            face_type = 0
-        face_types.append(face_type)
-        
-        try:
-            area = face.area()
-            face_areas.append(area)
-        except:
-            face_areas.append(0.0)
-        
-        try:
-            loop_count = face.number_of_loops()
-            face_loops.append(loop_count)
-        except:
-            face_loops.append(1)
-        
-        adj_count = 0
-        for edge in graph.edges:
-            if edge[0] == face_idx or edge[1] == face_idx:
-                adj_count += 1
-        face_adjs.append(adj_count)
-    
-    # 转换为numpy数组
-    graph_face_feat = np.asarray(graph_face_feat)
-    face_types = np.array(face_types)
-    face_areas = np.array(face_areas, dtype=np.float32)
-    face_loops = np.array(face_loops)
-    face_adjs = np.array(face_adjs)
+    import dgl
 
-    # 准备边特征列表 - 修正为7通道
-    graph_edge_feat = []    # U网格几何特征 [n, 7]
-    edge_types = []         # 边类型
-    edge_lengths = []       # 边长度
-    edge_angles = []        # 边角度
-    edge_convs = []         # 边凸度
-    
-    # 处理每条边
-    for edge_idx in graph.edges:
-        edge = graph.edges[edge_idx]["edge"]
-        
-        # 忽略没有曲线的边（如圆锥顶点）
-        if not edge.has_curve():
-            # 添加默认值
-            edge_types.append(0)
-            edge_lengths.append(0.0)
-            edge_angles.append(0.0)
-            edge_convs.append(0)
-            continue
-        
-        # U网格采样 - 6通道特征
-        points = ugrid(edge, method="point", num_u=curv_num_u_samples)
-        tangents = ugrid(edge, method="tangent", num_u=curv_num_u_samples)
-        
-        # 修正：将6通道扩展为7通道
-        # 拼接成6通道特征 [n, 6] - XYZ(3) + 切线(3)
-        edge_feat_6ch = np.concatenate((points, tangents), axis=-1)
-        
-        # # 添加第7个通道（零填充）
-        # zero_channel = np.zeros((edge_feat_6ch.shape[0], 1), dtype=np.float32)
-        # edge_feat = np.concatenate((edge_feat_6ch, zero_channel), axis=-1)
-        # 添加第7个通道（一填充）- 使用np.full
-        one_channel = np.full((edge_feat_6ch.shape[0], 1), 1.5707963705062866, dtype=np.float32)
-        edge_feat = np.concatenate((edge_feat_6ch, one_channel), axis=-1)
-        
-        graph_edge_feat.append(edge_feat)
-        
-        # 获取边类型
-        try:
-            curve_type = str(edge.curve_type()).lower()
-            edge_type = EDGE_TYPE_MAP.get(curve_type, 0)
-        except:
-            edge_type = 0
-        edge_types.append(edge_type)
-        
-        # 计算边长度
-        try:
-            start_point = edge.start_point()
-            end_point = edge.end_point()
-            length = np.linalg.norm(np.array(end_point) - np.array(start_point))
-            edge_lengths.append(length)
-        except:
-            edge_lengths.append(0.0)
-        
-        # 计算边角度（简化版）
-        try:
-            if curv_num_u_samples >= 2:
-                start_tangent = tangents[0]
-                end_tangent = tangents[-1]
-                start_tangent_norm = start_tangent / (np.linalg.norm(start_tangent) + 1e-10)
-                end_tangent_norm = end_tangent / (np.linalg.norm(end_tangent) + 1e-10)
-                angle = np.arccos(np.clip(np.dot(start_tangent_norm, end_tangent_norm), -1.0, 1.0))
-                edge_angles.append(angle)
-            else:
-                edge_angles.append(0.0)
-        except:
-            edge_angles.append(0.0)
-        
-        # 计算边凸度（简化版）
-        try:
-            edge_convs.append(CONVEXITY_MAP["convex"])
-        except:
-            edge_convs.append(1)
-    
-    # 转换为numpy数组
-    edge_types = np.array(edge_types, dtype=np.int32)
-    edge_lengths = np.array(edge_lengths, dtype=np.float32)
-    edge_angles = np.array(edge_angles, dtype=np.float32)
-    edge_convs = np.array(edge_convs, dtype=np.int32)
-    
-    # 处理空的边特征
-    if len(graph_edge_feat) == 0:
-        graph_edge_feat = np.array([], dtype=np.float32)
-    else:
-        graph_edge_feat = np.asarray(graph_edge_feat)
-
-    # 创建DGL图
-    edges = list(graph.edges)
-    src = [e[0] for e in edges]
-    dst = [e[1] for e in edges]
-    num_nodes = len(graph.nodes)
-    dgl_graph = dgl.graph((src, dst), num_nodes=num_nodes)
-    
-    # 添加节点特征（BrepMFR要求的字段名）
-    dgl_graph.ndata["x"] = torch.from_numpy(graph_face_feat).float()  # UV网格特征
-    dgl_graph.ndata["z"] = torch.from_numpy(face_types).int()        # 面类型
-    dgl_graph.ndata["y"] = torch.from_numpy(face_areas).float()       # 面面积
-    dgl_graph.ndata["l"] = torch.from_numpy(face_loops).int()         # 环数量
-    dgl_graph.ndata["a"] = torch.from_numpy(face_adjs).int()          # 相邻面数量
-    dgl_graph.ndata["f"] = torch.zeros(num_nodes, dtype=torch.int)    # 标签特征
-    
-    # 添加边特征（BrepMFR要求的字段名）- 修正为7通道
-    if len(graph_edge_feat) > 0:
-        num_edges = len(graph_edge_feat)
-        num_samples = curv_num_u_samples
-        
-        # 确保格式为 [num_edges, channels=7, num_samples]
-        edge_data = torch.zeros((num_edges, num_samples, 7), dtype=torch.float)
-        
-        for i, feat in enumerate(graph_edge_feat):
-            # 确保特征有7个通道
-            if feat.shape[-1] < 7:
-                # 如果通道数不足，用零填充
-                padding = np.zeros((feat.shape[0], 7 - feat.shape[-1]), dtype=np.float32)
-                feat = np.concatenate((feat, padding), axis=-1)
-            
-            # 转置为 [7, num_samples]
-            edge_data[i] = torch.from_numpy(feat)
-        
-        dgl_graph.edata["x"] = edge_data
-    
-    dgl_graph.edata["t"] = torch.from_numpy(edge_types).int()        # 边类型
-    dgl_graph.edata["l"] = torch.from_numpy(edge_lengths).float()     # 边长度
-    dgl_graph.edata["a"] = torch.from_numpy(edge_angles).float()      # 边角度
-    dgl_graph.edata["c"] = torch.from_numpy(edge_convs).int()        # 边凸度
-    
-    # 添加图元数据（BrepMFR要求的）
-    dgl_graph.gdata = {}
-    
-    # 1. edges_path - [num_nodes, num_nodes, max_dist]
-    max_dist = 16
-    edges_path = np.zeros((num_nodes, num_nodes, max_dist), dtype=np.int32)
-    
-    for i, edge in enumerate(edges):
-        u, v = edge
-        edges_path[u, v, 0] = i + 1
-        edges_path[v, u, 0] = i + 1
-    
-    for i in range(num_nodes):
-        edges_path[i, i, 0] = 0
-    
-    dgl_graph.gdata["edges_path"] = torch.from_numpy(edges_path).int()
-    
-    # 2. spatial_pos - 基于面质心的空间位置
-    centroids = []
-    for face_idx in graph.nodes:
-        face = graph.nodes[face_idx]["face"]
-        try:
-            centroid = face.mid_point()
-            centroids.append(centroid)
-        except:
-            centroids.append([0.0, 0.0, 0.0])
-    
-    spatial_pos = np.zeros((num_nodes, num_nodes), dtype=np.int32)
-    for i in range(num_nodes):
-        for j in range(num_nodes):
-            distance = np.linalg.norm(np.array(centroids[i]) - np.array(centroids[j]))
-            spatial_pos[i, j] = int(distance * 1000)
-    
-    dgl_graph.gdata["spatial_pos"] = torch.from_numpy(spatial_pos).int()
-    
-    # 3. d2_distance 和 angle_distance（填充默认值）
-    dgl_graph.gdata["d2_distance"] = torch.zeros(num_nodes, num_nodes, 64, dtype=torch.float)
-    dgl_graph.gdata["angle_distance"] = torch.zeros(num_nodes, num_nodes, 64, dtype=torch.float)
-    
+    adj = face_adjacency(solid)
+    t = tensor_dict_from_face_adjacency(
+        adj, curv_num_u_samples, surf_num_u_samples, surf_num_v_samples
+    )
+    ei = t["edge_index"]
+    dgl_graph = dgl.graph((ei[0], ei[1]), num_nodes=t["num_nodes"])
+    dgl_graph.ndata["x"] = t["node_data"]
+    dgl_graph.ndata["z"] = t["face_type"]
+    dgl_graph.ndata["y"] = t["face_area"]
+    dgl_graph.ndata["l"] = t["face_loop"]
+    dgl_graph.ndata["a"] = t["face_adj"]
+    dgl_graph.ndata["f"] = t["label_feature"]
+    if t["edge_data"] is not None:
+        dgl_graph.edata["x"] = t["edge_data"]
+    dgl_graph.edata["t"] = t["edge_type"]
+    dgl_graph.edata["l"] = t["edge_len"]
+    dgl_graph.edata["a"] = t["edge_ang"]
+    dgl_graph.edata["c"] = t["edge_conv"]
+    dgl_graph.gdata = {
+        "edges_path": t["edges_path"],
+        "spatial_pos": t["spatial_pos"],
+        "d2_distance": t["d2_distance"],
+        "angle_distance": t["angle_distance"],
+    }
     return dgl_graph
 
 def save_to_binary(graph, filename):
@@ -303,6 +82,7 @@ def save_to_binary(graph, filename):
         graph: DGL图对象
         filename: 输出文件路径
     """
+    import dgl
     metadata = {}
     
     # 从gdata提取元数据
@@ -388,7 +168,7 @@ def convert_stp_to_bin(stp_file_path, output_bin_path=None, curv_u_samples=5, su
             # 不返回，继续执行以覆盖文件
         
         print(f"转换文件: {stp_file_path}")
-        solids = load_step(stp_file_path)
+        solids = list(Compound.load_from_step(stp_file_path).solids())
         if not solids or len(solids) == 0:
             print(f"警告: 文件中未找到实体: {stp_file_path}")
             return None
@@ -414,6 +194,8 @@ def convert_stp_to_bin(stp_file_path, output_bin_path=None, curv_u_samples=5, su
 
 def create_test_graph():
     """创建测试图"""
+    import dgl
+
     # 创建简单图结构
     src = [0, 1, 2]
     dst = [1, 2, 0]
@@ -478,6 +260,8 @@ def test_save_load():
     
     # 测试加载图
     try:
+        import dgl
+
         graphs, metadata = dgl.data.utils.load_graphs(test_file)
         loaded_graph = graphs[0]
         

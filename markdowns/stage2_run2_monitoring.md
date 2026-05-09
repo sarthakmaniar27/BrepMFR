@@ -172,12 +172,15 @@ loss = loss_s + 0.5 * loss_adv
 python domain_adapt.py train \
   --source_path <path_to_CADSynth> \
   --target_path <path_to_MFCAD++> \
-  --pre_train results/<stage1_best>.ckpt \
+  --pre_train results/stage1/<your_stage1_run>/best.ckpt \
   --max_epochs 200 \
   --batch_size 64 \
   --num_workers 0 \
   --num_classes 25 \
-  --experiment_name BrepToSeq-segmentation
+  --iwdan \
+  --iwdan_source_priors artifacts/class_weights/stage2_iwdan/source_train_priors.json \
+  --iwdan_target_priors artifacts/class_weights/stage2_iwdan/target_train_priors.json \
+  --run_name transfer_iwdan_weighted__slow_grl_trial
 ```
 
 ---

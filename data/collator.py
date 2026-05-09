@@ -1,9 +1,22 @@
 # -*- coding: utf-8 -*-
 import torch
-import dgl
 import sys
 sys.path.append('..')
 from models.modules.utils.macro import *
+
+
+def batch_edge_index(edge_indices, num_nodes_per_graph):
+    """Concatenate per-graph COO indices with node offsets (same layout as dgl.batch)."""
+    if not edge_indices:
+        return torch.zeros(2, 0, dtype=torch.long)
+    offset = 0
+    parts = []
+    for ei, n in zip(edge_indices, num_nodes_per_graph):
+        ei = ei.long()
+        parts.append(ei + offset)
+        offset += int(n)
+    return torch.cat(parts, dim=1)
+
 
 def pad_mask_unsqueeze(x, padlen):  #x[num_nodes]
     xlen = x.size(0)
@@ -76,7 +89,7 @@ def pad_3d_unsqueeze(x, padlen1, padlen2, padlen3):  #x[num_nodes, num_nodes, ma
 def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, PYGGraph_1_mian}, {PYGGraph_2, PYGGraph_2_mian}, ..., PYGGraph_batchsize)
     items = [
         (
-            item.graph,
+            item.edge_index,
             item.node_data,  #node_data[num_nodes, U_grid, V_grid, pnt_feature]
             item.face_area,
             item.face_type,
@@ -100,7 +113,7 @@ def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, P
     ]
 
     (
-        graphs,
+        edge_indices,
         node_datas,
         face_areas,
         face_types,
@@ -183,7 +196,8 @@ def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, P
     # in_degree = torch.cat([pad_1d_unsqueeze(i, max_node_num) for i in in_degrees]) #in_degree(batch_size, [num_nodes])
     in_degree = torch.cat([i for i in node_degrees])
 
-    batched_graph = dgl.batch([i for i in graphs])
+    num_nodes_list = [nd.size(0) for nd in node_datas]
+    batched_edge_index = batch_edge_index(edge_indices, num_nodes_list)
 
     # face feature type
     batched_label_feature = torch.cat([i for i in label_features])
@@ -193,7 +207,7 @@ def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, P
     batch_data = dict(
         padding_mask = padding_mask,       #[batch_size, max_node_num]
         edge_padding_mask = edge_padding_mask,  #[batch_size, max_edge_num]
-        graph=batched_graph,
+        edge_index=batched_edge_index,
 
         node_data = node_data,             #[total_node_num, U_grid, V_grid, pnt_feature]
         face_area = face_area,             #[total_node_num]
@@ -225,7 +239,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
     # source_CAD-----------------------------------------------------------------
     items_source = [
         (
-            item["source_data"].graph,
+            item["source_data"].edge_index,
             item["source_data"].node_data,  # node_data[num_nodes, U_grid, V_grid, pnt_feature]
             item["source_data"].face_area,
             item["source_data"].face_type,
@@ -236,7 +250,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
             item["source_data"].edge_len,
             item["source_data"].edge_ang,
             item["source_data"].edge_conv,
-            item["source_data"].in_degree,
+            item["source_data"].node_degree,
             item["source_data"].attn_bias,
             item["source_data"].spatial_pos,
             item["source_data"].d2_distance,
@@ -250,7 +264,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
     # target_CAD------------------------------------------------------------------
     items_target = [
         (
-            item["target_data"].graph,
+            item["target_data"].edge_index,
             item["target_data"].node_data,  # node_data[num_nodes, U_grid, V_grid, pnt_feature]
             item["target_data"].face_area,
             item["target_data"].face_type,
@@ -261,7 +275,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
             item["target_data"].edge_len,
             item["target_data"].edge_ang,
             item["target_data"].edge_conv,
-            item["target_data"].in_degree,
+            item["target_data"].node_degree,
             item["target_data"].attn_bias,
             item["target_data"].spatial_pos,
             item["target_data"].d2_distance,
@@ -275,7 +289,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
     items = items_source + items_target
 
     (
-        graphs,
+        edge_indices,
         node_datas,
         face_areas,
         face_types,
@@ -286,7 +300,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
         edge_lens,
         edge_angs,
         edge_convs,
-        in_degrees,
+        node_degrees,
         attn_biases,
         spatial_poses,
         d2_distancees,
@@ -298,8 +312,6 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
 
     for idx, _ in enumerate(attn_biases):
         attn_biases[idx][1:, 1:][spatial_poses[idx] >= spatial_pos_max] = float("-inf")
-
-    batched_graph = dgl.batch([i for i in graphs])
 
     max_node_num = max(i.size(0) for i in node_datas)  # 计算这批数据中图节点的最大数量
     max_edge_num = max(i.size(0) for i in edge_datas)
@@ -357,8 +369,10 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
     )
 
     # 中心性编码
-    # in_degree = torch.cat([pad_1d_unsqueeze(i, max_node_num) for i in in_degrees]) #in_degree(batch_size, [num_nodes])
-    in_degree = torch.cat([i for i in in_degrees])
+    in_degree = torch.cat([i for i in node_degrees])
+
+    num_nodes_list = [nd.size(0) for nd in node_datas]
+    batched_edge_index = batch_edge_index(edge_indices, num_nodes_list)
 
     batched_label_feature = torch.cat([i for i in label_features])
 
@@ -367,7 +381,7 @@ def collator_st(items, multi_hop_max_dist, spatial_pos_max):
     batch_data = dict(
         padding_mask=padding_mask,  # [batch_size, max_node_num]
         edge_padding_mask=edge_padding_mask,  # [batch_size, max_edge_num]
-        graph=batched_graph,
+        edge_index=batched_edge_index,
 
         node_data=node_data,  # [total_node_num, U_grid, V_grid, pnt_feature]
         face_area=face_area,  # [batch_size, max_node_num] / [total_node_num]

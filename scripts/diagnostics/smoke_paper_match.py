@@ -1,5 +1,22 @@
 import argparse
+import importlib.util
 import inspect
+from pathlib import Path
+
+_bf = Path(__file__).resolve()
+for _ancestor in _bf.parents:
+    _bst = _ancestor / "bootstrap_path.py"
+    if _bst.is_file():
+        _spec = importlib.util.spec_from_file_location("__brepmfr_bootstrap", _bst)
+        _bm = importlib.util.module_from_spec(_spec)
+        assert _spec.loader is not None
+        _spec.loader.exec_module(_bm)
+        _bm.setup(str(_bf))
+        break
+else:
+    raise RuntimeError(
+        "bootstrap_path.py not found; keep scripts inside the BrepMFR_PyG repository."
+    )
 
 args = argparse.Namespace(
     num_classes=25, dropout=0.3, attention_dropout=0.3, act_dropout=0.3,

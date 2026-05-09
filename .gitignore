@@ -191,5 +191,7 @@ scripts/sorted_dumps/ours_faces.csv
 scripts/sorted_dumps/ours_edges.csv
 scripts/sorted_dumps/ours_pairs.csv
 
-# 16 MB validation report (regeneratable from script)
+# Large validation dumps (regeneratable; can exceed GitHub size limits).
 scripts/cadsynth_validation_report_1k.json
+scripts/validation/cadsynth_validation_report_1k.json
+scripts/validation/cadsynth_validation_report.json

@@ -30,10 +30,10 @@ For machining feature recognition, the network can be trained using:
 python segmentation.py train --dataset_path /path/to/dataset --max_epochs 1000 --batch_size 64
 ```
 
-The logs and checkpoints will be stored in a folder called `results/BrepMFR` based on the experiment name and timestamp, and can be monitored with Tensorboard:
+The logs and checkpoints go under **`results/stage1/<run_name>/`** (see [docs/training_runs.md](docs/training_runs.md)), and can be monitored with Tensorboard:
 
 ```
-tensorboard --logdir results/<experiment_name>
+tensorboard --logdir results/stage1/<run_name>/tensorboard
 ```
 
 ## Testing
@@ -41,6 +41,25 @@ tensorboard --logdir results/<experiment_name>
 The best checkpoints based on the smallest validation loss are saved in the results folder. The checkpoints can be used to test the model as follows:
 
 ```
-python segmentation.py test --dataset_path /path/to/dataset --checkpoint ./results/BrepMFR/best.ckpt --batch_size 64
+python segmentation.py test --dataset_path /path/to/dataset --checkpoint ./results/stage1/<run_name>/best.ckpt --batch_size 64
 ```
+
+## Repository layout (PyG fork — this workspace)
+
+- **`segmentation.py`**, **`domain_adapt.py`**: Stage 1 and Stage 2 training entrypoints (run from repo root).
+- **`models/`**, **`data/`**: Core Lightning models and dataloaders.
+- **`artifacts/class_weights/`**: Version-controlled canonical JSON for **Stage 1 CE weights** (`stage1/`) and **Stage 2 IWDAN priors** (`stage2_iwdan/`). See [`artifacts/class_weights/README.md`](artifacts/class_weights/README.md).
+- **`scripts/`**: Runnable utilities grouped by task ([`scripts/README.md`](scripts/README.md)); each script boots the repo root via **`bootstrap_path.py`**.
+- **`tools/`**: Dataset and pipeline maintenance utilities ([`tools/README.md`](tools/README.md)) — STEP/JSON converters, bin audits, renaming, chunking.
+- **`results/`**: Training logs and checkpoints only (typically gitignored).
+
+### Training run folders (`results/stage1`, `results/stage2`)
+
+- **`segmentation.py train`** → `results/stage1/<run_name>/` (default auto `ce_weighted_balanced__YYYY-MM-DD_HHMMSS_mmm` unless you pass **`--run_name`**).
+- **`domain_adapt.py train`** → `results/stage2/<run_name>/` (default **`transfer_iwdan_weighted__...`** if **`--iwdan`**, else **`transfer_dann__...`**).
+
+Checkpoints and TensorBoard events live **directly under that run folder** (no extra `MMDD/HHMMSS` nesting). Full convention and **which folder is your canonical balanced Stage 1 / Stage 2** are in **[docs/training_runs.md](docs/training_runs.md)**.
+
+**Not moved**: `results/diagnostics/` (eval outputs). Prefer **`artifacts/class_weights/`** over ad hoc JSON under `results/`.
+
 

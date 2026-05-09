@@ -8,7 +8,8 @@ import csv
 from collections import defaultdict
 from pathlib import Path
 
-CSV_PATH = Path(r"C:\Users\D58\Desktop\BrepMFR\scripts\sorted_dumps_full\only_face_label_mismatch.csv")
+_SCRIPTS = Path(__file__).resolve().parents[1]
+CSV_PATH = _SCRIPTS / "sorted_dumps_full" / "only_face_label_mismatch.csv"
 
 FACE_LABEL_NAME = {
     0: "Stock",

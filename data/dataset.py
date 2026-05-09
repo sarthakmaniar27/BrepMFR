@@ -7,16 +7,70 @@ import torch
 from torch import FloatTensor
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data as PYGGraph
-from dgl.data.utils import load_graphs
 from prefetch_generator import BackgroundGenerator
 
 from .collator import collator, collator_st
 from .utils import get_random_rotation, rotate_uvgrid
 
 
+def _load_pyg_sample(path: pathlib.Path) -> PYGGraph:
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _labels_from_sample(path: pathlib.Path, num_class: int) -> torch.Tensor:
+    obj = _load_pyg_sample(path)
+    return obj.label_feature
+
+
+def _resolve_dataset_split_list(root_dir: pathlib.Path, filename: str) -> pathlib.Path:
+    """Prefer root_dir/name; fall back to root_dir/output/name (Experiment6 layout after conversion)."""
+    direct = root_dir / filename
+    if direct.is_file():
+        return direct
+    under_output = root_dir / "output" / filename
+    if under_output.is_file():
+        return under_output
+    raise FileNotFoundError(
+        f"Split list missing: '{direct}' and '{under_output}' not found."
+    )
+
+
+def _dataloader_kw(num_workers: int):
+    # pin_memory=False: avoids extra copies; IPC still uses file-backed sharing on Windows.
+    kw = dict(num_workers=num_workers, drop_last=True, pin_memory=False)
+    if num_workers > 0:
+        kw["prefetch_factor"] = 1
+        # On Windows, persistent workers keep file mappings across epochs and often
+        # contribute to ERROR_COMMITMENT_LIMIT (1455) with huge collated batches.
+        kw["persistent_workers"] = os.name != "nt"
+    return kw
+
+
 class DataLoaderX(DataLoader):
+    """Prefetch on the main thread only; use for num_workers=0."""
+
     def __iter__(self):
         return BackgroundGenerator(super().__iter__())
+
+
+def _make_dataloader(dataset, collate_fn, batch_size, shuffle, num_workers):
+    """Workers + BackgroundGenerator double-prefetch and inflate Windows page-file use."""
+    dl_kw = _dataloader_kw(num_workers)
+    if num_workers > 0:
+        return DataLoader(
+            dataset=dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=collate_fn,
+            **dl_kw,
+        )
+    return DataLoaderX(
+        dataset=dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        **dl_kw,
+    )
 
 
 class CADSynth(Dataset):
@@ -26,70 +80,41 @@ class CADSynth(Dataset):
         split="train",
         random_rotate=False,
         num_class=33,
-    ):  
+    ):
         assert split in ("train", "val", "test")
         path = pathlib.Path(root_dir)
         self.split = split
         self.num_class = num_class
         self.random_rotate = random_rotate
         self.file_paths = []
-        self._get_filenames(path, filelist=split+".txt")
+        self._get_filenames(path, filelist=split + ".txt")
 
     def _get_filenames(self, root_dir, filelist):
         print(f"Loading data...")
-        with open(str(root_dir / f"{filelist}"), "r") as f:
+        list_path = _resolve_dataset_split_list(root_dir, filelist)
+        with open(list_path, "r", encoding="utf-8") as f:
             file_list = [x.strip() for x in f.readlines()]
-        for x in tqdm(root_dir.rglob(f"*[0-9].bin")):
+        for x in tqdm(root_dir.rglob(f"*[0-9].pt")):
             if x.stem in file_list:
                 self.file_paths.append(x)
         print("Done loading {} files".format(len(self.file_paths)))
 
-
     def load_one_graph(self, file_path):
-        graphfile = load_graphs(str(file_path))
-        graph = graphfile[0][0]
-        pyg_graph = PYGGraph()
-        pyg_graph.graph = graph
-        if(self.random_rotate):
+        pyg_graph = _load_pyg_sample(pathlib.Path(file_path))
+        if self.random_rotate:
             rotation = get_random_rotation()
-            graph.ndata["x"] = rotate_uvgrid(graph.ndata["x"], rotation)
-            graph.edata["x"] = rotate_uvgrid(graph.edata["x"], rotation)
-        pyg_graph.node_data = graph.ndata["x"].type(FloatTensor)  # node_data[num_nodes, U_grid, V_grid, pnt_feature]
-        pyg_graph.edge_data = graph.edata["x"].type(FloatTensor)  # edge_data[num_edges, U_grid, pnt_feature]
+            pyg_graph.node_data = rotate_uvgrid(pyg_graph.node_data, rotation)
+            pyg_graph.edge_data = rotate_uvgrid(pyg_graph.edge_data, rotation)
 
-        pyg_graph.face_type = graph.ndata["z"].type(torch.int)   # face_type[num_nodes]
-        pyg_graph.face_area = graph.ndata["y"].type(torch.float) # face_area[num_nodes]
-        pyg_graph.face_loop = graph.ndata["l"].type(torch.int)   # face_loop[num_nodes]
-        pyg_graph.face_adj = graph.ndata["a"].type(torch.int)    # face_loop[num_nodes]
-        pyg_graph.label_feature = graph.ndata["f"].type(torch.int)  # feature_type[num_nodes]
-
-        pyg_graph.edge_type = graph.edata["t"].type(torch.int)   # edge_type[num_edges]
-        pyg_graph.edge_len = graph.edata["l"].type(torch.float)  # edge_len[num_edges]
-        pyg_graph.edge_ang = graph.edata["a"].type(torch.float)  # edge_ang[num_edges]
-        pyg_graph.edge_conv = graph.edata["c"].type(torch.int)   # edge_conv[num_edges]
-
-        dense_adj = graph.adj().to_dense().type(torch.int)
-        n_nodes = graph.num_nodes()
-        pyg_graph.node_degree = dense_adj.long().sum(dim=1).view(-1)
-        pyg_graph.attn_bias = torch.zeros([n_nodes + 1, n_nodes + 1], dtype=torch.float)
-
-        pyg_graph.edge_path = graphfile[1]["edges_path"]           # edge_input[num_nodes, num_nodes, max_dist]
-        pyg_graph.spatial_pos = graphfile[1]["spatial_pos"]        # spatial_pos[num_nodes, num_nodes]
-        pyg_graph.d2_distance = graphfile[1]["d2_distance"]        # d2_distance[num_nodes, num_nodes, 64]
-        pyg_graph.angle_distance = graphfile[1]["angle_distance"]  # angle_distance[num_nodes, num_nodes, 64]
-
-        _, file_extension = os.path.splitext(file_path)
-        basename = os.path.basename(file_path).replace(file_extension, "")
-        pyg_graph.data_id = int(basename.split("_")[-1])
-
-        # if(torch.max(pyg_graph.label_feature) > 24 or torch.max(pyg_graph.label_feature) < 0):
-        #     print(pyg_graph.data_id)
-
-        if torch.max(pyg_graph.label_feature) >= self.num_class or torch.min(pyg_graph.label_feature) < 0:
-            print(f"Invalid label in graph id: {pyg_graph.data_id}, "
+        if torch.max(pyg_graph.label_feature) >= self.num_class or torch.min(
+            pyg_graph.label_feature
+        ) < 0:
+            print(
+                f"Invalid label in graph id: {pyg_graph.data_id}, "
                 f"min={torch.min(pyg_graph.label_feature).item()}, "
                 f"max={torch.max(pyg_graph.label_feature).item()}, "
-                f"expected range=[0, {self.num_class - 1}]")
+                f"expected range=[0, {self.num_class - 1}]"
+            )
 
         return pyg_graph
 
@@ -100,37 +125,29 @@ class CADSynth(Dataset):
         fn = self.file_paths[idx]
         sample = self.load_one_graph(fn)
         return sample
-        
-    def _collate(self, batch):  #batch=({PYGGraph_1, PYGGraph_1_mian}, {PYGGraph_2, PYGGraph_2_mian}, ..., PYGGraph_batchsize)
+
+    def _collate(self, batch):
         return collator(
             batch,
-            multi_hop_max_dist=16,  # multi_hop_max_dist: max distance of multi-hop edges 大于该值认为这两个节点没有关系，边编码为0
-            spatial_pos_max=32,     # spatial_pos_max: max distance of multi-hop edges 大于该值认为这两个节点没有关系，空间编码降为0
+            multi_hop_max_dist=16,
+            spatial_pos_max=32,
         )
 
     def get_dataloader(self, batch_size, shuffle=True, num_workers=0):
-        return DataLoaderX(
-            dataset=self,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=self._collate,
-            num_workers=num_workers,
-            drop_last=True,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=False
+        return _make_dataloader(
+            self, self._collate, batch_size, shuffle, num_workers,
         )
 
 
 class TransferDataset(Dataset):
     def __init__(
-            self,
-            root_dir_source,
-            root_dir_target,
-            split="train",
-            random_rotate=False,
-            num_class=25,
-            open_set=0
+        self,
+        root_dir_source,
+        root_dir_target,
+        split="train",
+        random_rotate=False,
+        num_class=25,
+        open_set=0,
     ):
         assert split in ("train", "val", "test")
         source_path = pathlib.Path(root_dir_source)
@@ -144,7 +161,6 @@ class TransferDataset(Dataset):
         self.target_file_paths = []
         self._get_filenames(source_path, target_path)
 
-
     def _get_filenames(self, source_dir, target_dir):
         if self.split == "train":
             filelist_s = "s_train.txt"
@@ -157,27 +173,27 @@ class TransferDataset(Dataset):
             filelist_t = "t_test.txt"
 
         print(f"Loading source data...")
-        with open(str(source_dir / f"{filelist_s}"), "r") as f:
+        s_list_path = _resolve_dataset_split_list(source_dir, filelist_s)
+        with open(s_list_path, "r", encoding="utf-8") as f:
             s_file_list = [x.strip() for x in f.readlines()]
-        for x in tqdm(source_dir.rglob(f"*[0-9].bin")):
+        for x in tqdm(source_dir.rglob(f"*[0-9].pt")):
             if x.stem in s_file_list:
-                if (self.open_set):
-                    bin_file = load_graphs(str(x))
-                    face_labels = bin_file[0][0].ndata["f"].type(torch.int)  # [num_nodes]
-                    if (torch.max(face_labels) > self.num_class):
+                if self.open_set:
+                    face_labels = _labels_from_sample(x, self.num_class)
+                    if torch.max(face_labels) > self.num_class:
                         continue
                 self.source_file_paths.append(x)
         print("Done loading {} files".format(len(self.source_file_paths)))
 
         print(f"Loading target data...")
-        with open(str(target_dir / f"{filelist_t}"), "r") as f:
+        t_list_path = _resolve_dataset_split_list(target_dir, filelist_t)
+        with open(t_list_path, "r", encoding="utf-8") as f:
             t_file_list = [x.strip() for x in f.readlines()]
-        for x in tqdm(target_dir.rglob(f"*[0-9].bin")):
+        for x in tqdm(target_dir.rglob(f"*[0-9].pt")):
             if x.stem in t_file_list:
-                if (self.open_set):
-                    bin_file = load_graphs(str(x))
-                    face_labels = bin_file[0][0].ndata["f"].type(torch.int)  # [num_nodes]
-                    if (torch.max(face_labels) > self.num_class):
+                if self.open_set:
+                    face_labels = _labels_from_sample(x, self.num_class)
+                    if torch.max(face_labels) > self.num_class:
                         continue
                 self.target_file_paths.append(x)
         print("Done loading {} files".format(len(self.target_file_paths)))
@@ -186,46 +202,18 @@ class TransferDataset(Dataset):
             random.shuffle(self.source_file_paths)
             random.shuffle(self.target_file_paths)
 
-
     def load_one_graph(self, file_path):
-        graphfile = load_graphs(str(file_path))
-        graph = graphfile[0][0]
-        pyg_graph = PYGGraph()
-        pyg_graph.graph = graph
-        if (self.random_rotate):
+        pyg_graph = _load_pyg_sample(pathlib.Path(file_path))
+        if self.random_rotate:
             rotation = get_random_rotation()
-            graph.ndata["x"] = rotate_uvgrid(graph.ndata["x"], rotation)
-            graph.edata["x"] = rotate_uvgrid(graph.edata["x"], rotation)
-        pyg_graph.node_data = graph.ndata["x"].type(FloatTensor)  # node_data[num_nodes, U_grid, V_grid, pnt_feature]
-        pyg_graph.edge_data = graph.edata["x"].type(FloatTensor)  # edge_data[num_edges, U_grid, pnt_feature]
-
-        pyg_graph.face_type = graph.ndata["z"].type(torch.int)  # face_type[num_nodes]
-        pyg_graph.face_area = graph.ndata["y"].type(torch.float)  # face_area[num_nodes]
-        pyg_graph.face_loop = graph.ndata["l"].type(torch.int)  # face_loop[num_nodes]
-        pyg_graph.face_adj = graph.ndata["a"].type(torch.int)   # face_loop[num_nodes]
-        pyg_graph.label_feature = graph.ndata["f"].type(torch.int)  # feature_type[num_nodes]
-
-        pyg_graph.edge_type = graph.edata["t"].type(torch.int)  # edge_type[num_edges]
-        pyg_graph.edge_len = graph.edata["l"].type(torch.float)  # edge_len[num_edges]
-        pyg_graph.edge_ang = graph.edata["a"].type(torch.float)  # edge_ang[num_edges]
-        pyg_graph.edge_conv = graph.edata["c"].type(torch.int)  # edge_conv[num_edges]
-
-        dense_adj = graph.adj().to_dense().type(torch.int)
-        n_nodes = graph.num_nodes()
-        pyg_graph.in_degree = dense_adj.long().sum(dim=1).view(-1)
-        pyg_graph.attn_bias = torch.zeros([n_nodes + 1, n_nodes + 1], dtype=torch.float)
-
-        pyg_graph.edge_path = graphfile[1]["edges_path"]  # edge_input[num_nodes, num_nodes, max_dist]
-        pyg_graph.spatial_pos = graphfile[1]["spatial_pos"]  # spatial_pos[num_nodes, num_nodes]
-        pyg_graph.d2_distance = graphfile[1]["d2_distance"]  # d2_distance[num_nodes, num_nodes, 64]
-        pyg_graph.angle_distance = graphfile[1]["angle_distance"]  # angle_distance[num_nodes, num_nodes, 64]
+            pyg_graph.node_data = rotate_uvgrid(pyg_graph.node_data, rotation)
+            pyg_graph.edge_data = rotate_uvgrid(pyg_graph.edge_data, rotation)
 
         _, file_extension = os.path.splitext(file_path)
         basename = os.path.basename(file_path).replace(file_extension, "")
         pyg_graph.data_id = int(basename.split("_")[-1])
 
         return pyg_graph
-
 
     def __len__(self):
         if self.split == "train":
@@ -237,9 +225,9 @@ class TransferDataset(Dataset):
         idx_s = idx
         idx_t = idx
         if idx_s >= len(self.source_file_paths):
-            idx_s = random.randint(0, len(self.source_file_paths)-1)
+            idx_s = random.randint(0, len(self.source_file_paths) - 1)
         if idx_t >= len(self.target_file_paths):
-            idx_t = random.randint(0, len(self.target_file_paths)-1)
+            idx_t = random.randint(0, len(self.target_file_paths) - 1)
 
         fn_s = self.source_file_paths[idx_s]
         fn_t = self.target_file_paths[idx_t]
@@ -249,22 +237,14 @@ class TransferDataset(Dataset):
         sample = {"source_data": sample_s, "target_data": sample_t}
         return sample
 
-    def _collate(self, batch):  # batch=({PYGGraph_1, PYGGraph_1_mian}, {PYGGraph_2, PYGGraph_2_mian}, ..., PYGGraph_batchsize)
+    def _collate(self, batch):
         return collator_st(
             batch,
-            multi_hop_max_dist=16,  # multi_hop_max_dist: max distance of multi-hop edges 大于该值认为这两个节点没有关系，边编码为0
-            spatial_pos_max=32,  # spatial_pos_max: max distance of multi-hop edges 大于该值认为这两个节点没有关系，空间编码降为0
+            multi_hop_max_dist=16,
+            spatial_pos_max=32,
         )
 
     def get_dataloader(self, batch_size, shuffle=True, num_workers=0):
-        return DataLoaderX(
-            dataset=self,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=self._collate,
-            num_workers=num_workers,
-            drop_last=True,
-            pin_memory=True,
-            prefetch_factor=2,
-            persistent_workers=False
+        return _make_dataloader(
+            self, self._collate, batch_size, shuffle, num_workers,
         )

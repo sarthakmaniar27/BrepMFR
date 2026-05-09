@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import json
 import pytorch_lightning as pl
 import torch
 from torch import nn
@@ -159,6 +160,45 @@ class BrepSeg(pl.LightningModule):
         self.warmup_freeze_epochs = getattr(args, "warmup_freeze_epochs", 0)
 
         # ---------------------------------------------------------
+        # Class-balanced loss weights
+        # ---------------------------------------------------------
+        # Stage 1 source training data is dominated by class 0 (~58% stock),
+        # which produces an over-confident classifier and label-shift on target.
+        # If --class_weights_path is provided, we load per-class weights from
+        # that JSON (computed by scripts/training/compute_class_weights.py) and apply
+        # them ONLY to the training-step CE loss. Validation loss stays
+        # unweighted so the LR scheduler sees a stable signal.
+        self.class_weights_path = getattr(args, "class_weights_path", None)
+        if self.class_weights_path and not pathlib.Path(
+            self.class_weights_path
+        ).expanduser().is_file():
+            print(
+                f"\nclass_weights_path not found ({self.class_weights_path}); "
+                f"using placeholder weights (checkpoint state_dict restores buffers)."
+            )
+            self.class_weights_path = None
+        if self.class_weights_path:
+            with open(self.class_weights_path, "r", encoding="utf-8") as f:
+                cw = json.load(f)
+            assert cw["num_classes"] == self.num_classes, (
+                f"class_weights JSON num_classes={cw['num_classes']} != "
+                f"model num_classes={self.num_classes}"
+            )
+            weights = torch.tensor(cw["weights"], dtype=torch.float32)
+            self.use_class_weights = True
+            print(f"\nLoaded class weights from: {self.class_weights_path}")
+            print(f"  method={cw['method']} alpha={cw['alpha']} "
+                  f"min={weights.min():.4f} max={weights.max():.4f} "
+                  f"mean={weights.mean():.4f}")
+        else:
+            weights = torch.ones(self.num_classes, dtype=torch.float32)
+            self.use_class_weights = False
+        # Register as buffer so it moves to GPU and round-trips through
+        # checkpoints. Even when unused (all 1.0) this keeps the model state
+        # shape consistent.
+        self.register_buffer("class_weights", weights)
+
+        # ---------------------------------------------------------
         # Load pretrained Stage-1 checkpoint selectively
         # - load brep_encoder
         # - load attention
@@ -267,12 +307,19 @@ class BrepSeg(pl.LightningModule):
         # loss-------------------------------------------------------------------------------------------
         labels = batch["label_feature"].long()
         labels_onehot = F.one_hot(labels, self.num_classes)
-        loss = CrossEntropyLoss(labels_onehot, node_seg)
+        # Apply class weights only when --class_weights_path was provided.
+        # When unused, self.class_weights is all-1.0 and the result is identical
+        # to unweighted CE, but we still pass None to skip a few ops.
+        cw = self.class_weights if self.use_class_weights else None
+        loss = CrossEntropyLoss(labels_onehot, node_seg, class_level_weight=cw)
         self.log("train_loss", loss, on_step=False, on_epoch=True)
         return loss
 
-    def training_epoch_end(self, training_step_outputs):
-        current_lr = self.optimizers().param_groups[0]["lr"]
+    def on_train_epoch_end(self):
+        opt = self.optimizers()
+        if isinstance(opt, (list, tuple)):
+            opt = opt[0]
+        current_lr = opt.param_groups[0]["lr"]
         self.log("current_lr", current_lr, on_step=False, on_epoch=True)
 
 
@@ -308,12 +355,12 @@ class BrepSeg(pl.LightningModule):
 
         return loss
 
-    def validation_epoch_end(self, val_step_outputs):
+    def on_validation_epoch_end(self):
         preds_np = np.array(self.pred)
         labels_np = np.array(self.label)
         self.pred = []
         self.label = []
-        per_face_comp = (preds_np == labels_np).astype(np.int)
+        per_face_comp = (preds_np == labels_np).astype(np.int64)
         self.log("per_face_accuracy", np.mean(per_face_comp))
 
     def test_step(self, batch, batch_idx):
@@ -355,7 +402,7 @@ class BrepSeg(pl.LightningModule):
         # out_face_feature = face_feature.long().detach().cpu().numpy()  # [n_graph, max_n_node]
         # for i in range(n_graph):
         #     # 计算每个graph的实际n_node
-        #     end_index = max_n_node - np.sum((out_face_feature[i][:] == -1).astype(np.int))
+        #     end_index = max_n_node - np.sum((out_face_feature[i][:] == -1).astype(np.int64))
         #     # masked出实际face feature
         #     pred_feature = out_face_feature[i][:end_index + 1]  # (n_node)
 
@@ -368,14 +415,14 @@ class BrepSeg(pl.LightningModule):
         #         feature_file.write("\n")
         #     feature_file.close()
 
-    def test_epoch_end(self, outputs):
+    def on_test_epoch_end(self):
         print("num_classes: %s" % self.num_classes)
         preds_np = np.array(self.pred)
         labels_np = np.array(self.label)
         self.pred = []
         self.label = []
 
-        per_face_comp = (preds_np == labels_np).astype(np.int)
+        per_face_comp = (preds_np == labels_np).astype(np.int64)
         self.log("per_face_accuracy", np.mean(per_face_comp))
         print("per_face_accuracy: %s" % np.mean(per_face_comp))
 
@@ -386,7 +433,7 @@ class BrepSeg(pl.LightningModule):
             if len(class_pos[0]) > 0:
                 class_i_preds = preds_np[class_pos]
                 class_i_label = labels_np[class_pos]
-                per_face_comp = (class_i_preds == class_i_label).astype(np.int)
+                per_face_comp = (class_i_preds == class_i_label).astype(np.int64)
                 per_class_acc.append(np.mean(per_face_comp))
                 print("class_%s_acc: %s" % (i+1, np.mean(per_face_comp)))
         self.log("per_class_accuracy", np.mean(per_class_acc))
@@ -400,11 +447,11 @@ class BrepSeg(pl.LightningModule):
             if len(pred_pos[0]) > 0 and len(label_pos[0]) > 0:
                 class_i_preds = preds_np[label_pos]
                 class_i_label = labels_np[label_pos]
-                Intersection = (class_i_preds == class_i_label).astype(np.int)
-                Union = (class_i_preds != class_i_label).astype(np.int)
+                Intersection = (class_i_preds == class_i_label).astype(np.int64)
+                Union = (class_i_preds != class_i_label).astype(np.int64)
                 class_i_preds_ = preds_np[pred_pos]
                 class_i_label_ = labels_np[pred_pos]
-                Union_ = (class_i_preds_ != class_i_label_).astype(np.int)
+                Union_ = (class_i_preds_ != class_i_label_).astype(np.int64)
                 per_class_iou.append(np.sum(Intersection) / (np.sum(Union) + np.sum(Intersection) + np.sum(Union_)))
         self.log("IoU", np.mean(per_class_iou))
         print("IoU: %s" % np.mean(per_class_iou))
@@ -417,7 +464,7 @@ class BrepSeg(pl.LightningModule):
         #     if len(class_pos[0]) > 0:
         #         class_i_preds = preds_np[class_pos]
         #         for j in range(0, self.num_classes):
-        #             per_face_comp = (class_i_preds == j).astype(np.int)
+        #             per_face_comp = (class_i_preds == j).astype(np.int64)
         #             acc_class_i = np.mean(per_face_comp)
         #             result_file.write(str(acc_class_i))
         #             if(j < self.num_classes-1):
@@ -485,7 +532,6 @@ class BrepSeg(pl.LightningModule):
             threshold_mode='rel',
             min_lr=1e-6,
             cooldown=2,
-            verbose=False,
         )
 
         return {
@@ -498,17 +544,7 @@ class BrepSeg(pl.LightningModule):
             },
         }
 
-    def optimizer_step(
-        self,
-        epoch,
-        batch_idx,
-        optimizer,
-        optimizer_idx,
-        optimizer_closure,
-        on_tpu,
-        using_native_amp,
-        using_lbfgs,
-    ):
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None, **kwargs):
         optimizer.step(closure=optimizer_closure)
 
         # Warmup: linearly ramp LR from 0 → 0.002 over first 5000 steps
