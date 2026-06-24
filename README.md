@@ -30,10 +30,10 @@ For machining feature recognition, the network can be trained using:
 python segmentation.py train --dataset_path /path/to/dataset --max_epochs 1000 --batch_size 64
 ```
 
-The logs and checkpoints go under **`results/stage1/<run_name>/`** (see [docs/training_runs.md](docs/training_runs.md)), and can be monitored with Tensorboard:
+The **checkpoints** go under **`results/stage1/<run_name>/`**, while **logs** (TensorBoard, optional CSV/W&B) go under **`results/logs/stage1/<run_name>/`** (see [docs/training_runs.md](docs/training_runs.md)). Monitor TensorBoard:
 
 ```
-tensorboard --logdir results/stage1/<run_name>/tensorboard
+tensorboard --logdir results/logs/stage1/<run_name>/tensorboard
 ```
 
 ## Testing
@@ -49,16 +49,19 @@ python segmentation.py test --dataset_path /path/to/dataset --checkpoint ./resul
 - **`segmentation.py`**, **`domain_adapt.py`**: Stage 1 and Stage 2 training entrypoints (run from repo root).
 - **`models/`**, **`data/`**: Core Lightning models and dataloaders.
 - **`artifacts/class_weights/`**: Version-controlled canonical JSON for **Stage 1 CE weights** (`stage1/`) and **Stage 2 IWDAN priors** (`stage2_iwdan/`). See [`artifacts/class_weights/README.md`](artifacts/class_weights/README.md).
+- **`artifacts/baseline/`**: Immutable reference pointers for reproducibility (frozen **Full-A2** weighted Stage 1 and related artifacts). See [`artifacts/baseline/README.md`](artifacts/baseline/README.md).
 - **`scripts/`**: Runnable utilities grouped by task ([`scripts/README.md`](scripts/README.md)); each script boots the repo root via **`bootstrap_path.py`**.
 - **`tools/`**: Dataset and pipeline maintenance utilities ([`tools/README.md`](tools/README.md)) — STEP/JSON converters, bin audits, renaming, chunking.
-- **`results/`**: Training logs and checkpoints only (typically gitignored).
+- **`results/`**: Training outputs only (typically gitignored): **checkpoints** under `results/stage{1,2}/`, **logs** (TensorBoard, CSV, W&B) under `results/logs/stage{1,2}/`.
 
-### Training run folders (`results/stage1`, `results/stage2`)
+### Training run folders
 
-- **`segmentation.py train`** → `results/stage1/<run_name>/` (default auto `ce_weighted_balanced__YYYY-MM-DD_HHMMSS_mmm` unless you pass **`--run_name`**).
-- **`domain_adapt.py train`** → `results/stage2/<run_name>/` (default **`transfer_iwdan_weighted__...`** if **`--iwdan`**, else **`transfer_dann__...`**).
+- **`segmentation.py train`** → checkpoints: `results/stage1/<run_name>/`; logs: `results/logs/stage1/<run_name>/`.
+- **`domain_adapt.py train`** → checkpoints: `results/stage2/<run_name>/`; logs: `results/logs/stage2/<run_name>/`.
 
-Checkpoints and TensorBoard events live **directly under that run folder** (no extra `MMDD/HHMMSS` nesting). Full convention and **which folder is your canonical balanced Stage 1 / Stage 2** are in **[docs/training_runs.md](docs/training_runs.md)**.
+Checkpoints stay top-level under the stage folder (no extra `MMDD/HHMMSS` nesting). Logs use Lightning `version_*` subfolders inside `tensorboard/` and `csv_metrics/`. Full convention and **canonical balanced Stage 1 / Stage 2** pointers are in **[docs/training_runs.md](docs/training_runs.md)**.
+
+**Frozen Full-A2 baseline** (weighted CE Stage 1) is recorded under **`artifacts/baseline/`**.
 
 **Not moved**: `results/diagnostics/` (eval outputs). Prefer **`artifacts/class_weights/`** over ad hoc JSON under `results/`.
 

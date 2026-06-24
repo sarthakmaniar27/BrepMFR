@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Dump scalar summaries from a TensorBoard logdir (EventAccumulator)."""
+"""Dump scalar summaries from a TensorBoard logdir (EventAccumulator).
+
+Also inspect ``meta/*`` tags emitted by ``TrainingMetaLoggerCallback``
+(dataset lengths, class-weight alpha, etc.).
+"""
 import argparse
 from pathlib import Path
 
@@ -10,7 +14,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "logdir",
-        help="Folder containing events.out.tfevents* (e.g. results/.../0505/134214_...)",
+        help="Folder containing events.out.tfevents* (usually .../tensorboard/version_*/ after the logs split).",
     )
     args = ap.parse_args()
     root = Path(args.logdir)

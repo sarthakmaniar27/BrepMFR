@@ -53,6 +53,11 @@ def bin_to_pyg(bin_path: Path | str) -> PYGGraph:
     pyg.d2_distance = graphfile[1]["d2_distance"]
     pyg.angle_distance = graphfile[1]["angle_distance"]
 
+    pyg.has_a1 = True
+    pyg.has_a2 = True
+    pyg.has_a3 = True
+    pyg.inference_profile = "full"
+
     stem = bin_path.stem
     try:
         pyg.data_id = int(stem.split("_")[-1])

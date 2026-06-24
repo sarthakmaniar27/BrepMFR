@@ -68,7 +68,11 @@ from tqdm import tqdm
 # training. If the migration introduced a subtle preprocessing bug, we want it
 # reflected here too — that is precisely what we're auditing.
 from data.collator import collator
-from data.dataset import _load_pyg_sample, _resolve_dataset_split_list
+from data.dataset import (
+    _load_pyg_sample,
+    _resolve_dataset_split_list,
+    _resolve_graph_pt_scan_root,
+)
 from models.brepseg_model import BrepSeg
 
 
@@ -84,13 +88,18 @@ class FilelistDataset(Dataset):
     to '<split>.txt', and the transfer experiment uses 's_val.txt' / 't_val.txt'.
     """
 
-    def __init__(self, root_dir: str, filelist: str):
+    def __init__(
+        self, root_dir: str, filelist: str, pt_subdir: str | None = None
+    ):
         path = pathlib.Path(root_dir)
         list_path = _resolve_dataset_split_list(path, filelist)
+        scan_root = _resolve_graph_pt_scan_root(path, pt_subdir)
         with open(list_path, "r", encoding="utf-8") as f:
             wanted = set(line.strip() for line in f if line.strip())
 
-        self.file_paths = [p for p in path.rglob("*[0-9].pt") if p.stem in wanted]
+        self.file_paths = [
+            p for p in scan_root.rglob("*[0-9].pt") if p.stem in wanted
+        ]
         print(f"[{filelist}] resolved {list_path} -> {len(self.file_paths)} files")
         if len(self.file_paths) == 0:
             raise RuntimeError(
@@ -533,6 +542,14 @@ def main():
         default=0,
         help="If >0, stop after this many batches per domain (smoke-test mode)",
     )
+    parser.add_argument(
+        "--pt_subdir",
+        default=None,
+        help=(
+            "Optional path relative to each dataset root to scan for .pt files "
+            "(e.g. output/bin_skip_a2). Omit to rglob under the full root."
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = pathlib.Path(args.out_dir)
@@ -544,11 +561,15 @@ def main():
     model = load_stage1_model(args.checkpoint, device)
 
     print("\nBuilding source val dataset")
-    src_ds = FilelistDataset(args.source_path, args.source_filelist)
+    src_ds = FilelistDataset(
+        args.source_path, args.source_filelist, args.pt_subdir
+    )
     src_loader = make_loader(src_ds, args.batch_size, args.num_workers)
 
     print("Building target val dataset")
-    tgt_ds = FilelistDataset(args.target_path, args.target_filelist)
+    tgt_ds = FilelistDataset(
+        args.target_path, args.target_filelist, args.pt_subdir
+    )
     tgt_loader = make_loader(tgt_ds, args.batch_size, args.num_workers)
 
     if args.max_batches > 0:

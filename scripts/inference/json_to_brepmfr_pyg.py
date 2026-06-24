@@ -14,6 +14,21 @@ SolidWorks macro JSON → ``torch_geometric.data.Data``, saved as ``.pt`` (+ opt
 This script merges (1)+(2)+(3)'s numeric result in one PyTorch-only path: every ``.pt`` is written
 like **post-``append_angle``** graphs. You do **not** run ``append_angle_7th_channel`` anymore.
 
+**Inference profiles** (``--inference_profile``):
+
+- ``full``: A1 shortest-path tensors, A2 from ``face_pairs``, A3 ``edge_path``, ``attn_bias``.
+- ``no_a2``: Same as full but **omits** ``d2_distance`` / ``angle_distance`` (no dense A2 on disk).
+  Collator / ``GraphAttnBias`` run in A2-disabled mode (not numerically identical to legacy
+  zero-filled A2 because of BatchNorm paths).
+- ``lite``: Omits A2, A1, A3, and **does not store** ``spatial_pos``, ``edge_path``, or ``attn_bias``
+  (smallest ``.pt`` + fastest JSON ingest). Collator synthesizes ``attn_bias`` for attention.
+
+**Speed:** ``no_a2`` and ``full`` still run **all-pairs shortest paths** (A1); omitting A2 does not
+remove that cost. Use ``lite`` to skip A1 entirely, and/or ``--shortest_path_workers N`` (``N>1``)
+to parallelize BFS over source nodes on large graphs.
+
+``--skip_a2`` is kept as a **deprecated** alias for ``--inference_profile no_a2``.
+
 Dataset loading (``CADSynth``, ``TransferDataset``): ``torch.load(...)`` unchanged. **No DGL**
 required on this ingest path.
 
@@ -37,17 +52,21 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 import traceback
 from collections import deque, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import numpy as np
 import torch
 from torch import FloatTensor
 from torch_geometric.data import Data as PYGGraph
 from tqdm import tqdm
+
+InferenceProfile = Literal["full", "no_a2", "lite"]
 
 
 def _reshape_face_uv(flat_uv: list, U: int = 5, V: int = 5, C: int = 7) -> np.ndarray:
@@ -74,15 +93,18 @@ def _wrap_edge_uv_angle_ch7(edge_x: np.ndarray) -> None:
     edge_x[:, :, 6] = (edge_x[:, :, 6] + pi) % two_pi - pi
 
 
-def _compute_shortest_paths_edge_indices(src_nodes, dst_nodes, num_nodes, max_dist=16):
-    """
-    Computes A1 (Shortest path distance) and A3 (Chain of edge indices).
-    Matches Graphormer-style encoding where edges_path stores the sequence of edge IDs.
-    """
-    adj = [[] for _ in range(num_nodes)]
+def _directed_adj_with_edge_ids(src_nodes, dst_nodes, num_nodes: int) -> list[list[tuple[int, int]]]:
+    """Adjacency with parallel edge arc ids (same order as ``final_src`` / ``final_dst``)."""
+    adj: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
     for ei, (u, v) in enumerate(zip(src_nodes, dst_nodes)):
         adj[u].append((v, ei))
+    return adj
 
+
+def _shortest_paths_from_adj_serial(adj: list[list[tuple[int, int]]], num_nodes: int, max_dist: int):
+    """
+    A1 + edge_path chain (Graphormer-style). Pure Python; ``O(num_nodes * (num_nodes + E))``.
+    """
     spatial_pos = torch.full((num_nodes, num_nodes), fill_value=10**9, dtype=torch.int32)
     edges_path = torch.full((num_nodes, num_nodes, max_dist), fill_value=-1, dtype=torch.int32)
 
@@ -121,6 +143,110 @@ def _compute_shortest_paths_edge_indices(src_nodes, dst_nodes, num_nodes, max_di
                 edges_path[s, t, k] = int(path_edges[k])
 
     return spatial_pos, edges_path
+
+
+# ProcessPool workers (spawn on Windows): adj + max_dist set once per pool.
+_SP_ADJ_WORKER: list[list[tuple[int, int]]] | None = None
+_SP_MAX_DIST_WORKER: int = 16
+
+
+def _shortest_paths_worker_init(adj: list[list[tuple[int, int]]], max_dist: int) -> None:
+    global _SP_ADJ_WORKER, _SP_MAX_DIST_WORKER
+    _SP_ADJ_WORKER = adj
+    _SP_MAX_DIST_WORKER = int(max_dist)
+
+
+def _shortest_paths_worker_one_row(s: int) -> tuple[int, np.ndarray, np.ndarray]:
+    """Compute one source row: distances and edge-id chains (numpy for cheap IPC)."""
+    adj = _SP_ADJ_WORKER
+    max_dist = _SP_MAX_DIST_WORKER
+    assert adj is not None
+    num_nodes = len(adj)
+
+    dist_row = np.full(num_nodes, 10**9, dtype=np.int32)
+    path_block = np.full((num_nodes, max_dist), -1, dtype=np.int32)
+    dist_row[s] = 0
+
+    dist = [-1] * num_nodes
+    prev_node = [-1] * num_nodes
+    prev_edge = [-1] * num_nodes
+    q = deque([s])
+    dist[s] = 0
+
+    while q:
+        u = q.popleft()
+        for v, ei in adj[u]:
+            if dist[v] == -1:
+                dist[v] = dist[u] + 1
+                prev_node[v] = u
+                prev_edge[v] = ei
+                q.append(v)
+
+    for t in range(num_nodes):
+        if dist[t] == -1:
+            continue
+        dist_row[t] = dist[t]
+        if t == s:
+            continue
+        path_edges: list[int] = []
+        cur = t
+        while cur != s and cur != -1:
+            path_edges.append(prev_edge[cur])
+            cur = prev_node[cur]
+        path_edges.reverse()
+        for k in range(min(len(path_edges), max_dist)):
+            path_block[t, k] = int(path_edges[k])
+
+    return s, dist_row, path_block
+
+
+def _shortest_paths_from_adj_parallel(
+    adj: list[list[tuple[int, int]]],
+    num_nodes: int,
+    max_dist: int,
+    num_workers: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n_workers = min(int(num_workers), num_nodes, os.cpu_count() or 1)
+    spatial_pos = torch.full((num_nodes, num_nodes), fill_value=10**9, dtype=torch.int32)
+    edges_path = torch.full((num_nodes, num_nodes, max_dist), fill_value=-1, dtype=torch.int32)
+    chunksize = max(1, num_nodes // (n_workers * 8))
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        initializer=_shortest_paths_worker_init,
+        initargs=(adj, max_dist),
+    ) as pool:
+        for s, dist_row, path_block in pool.map(
+            _shortest_paths_worker_one_row,
+            range(num_nodes),
+            chunksize=chunksize,
+        ):
+            spatial_pos[s] = torch.from_numpy(dist_row)
+            edges_path[s] = torch.from_numpy(path_block)
+
+    return spatial_pos, edges_path
+
+
+def _compute_shortest_paths_edge_indices(
+    src_nodes,
+    dst_nodes,
+    num_nodes: int,
+    max_dist: int = 16,
+    num_workers: int = 0,
+):
+    """
+    Computes A1 (Shortest path distance) and A3 (Chain of edge indices).
+    Matches Graphormer-style encoding where edges_path stores the sequence of edge IDs.
+    """
+    adj = _directed_adj_with_edge_ids(src_nodes, dst_nodes, num_nodes)
+    use_parallel = (
+        num_workers > 1
+        and num_nodes >= 64
+        and (os.cpu_count() or 1) >= 2
+    )
+    if use_parallel:
+        return _shortest_paths_from_adj_parallel(adj, num_nodes, max_dist, num_workers)
+    return _shortest_paths_from_adj_serial(adj, num_nodes, max_dist)
 
 
 def _build_a2_tensors(data: dict, face_id_to_node: dict, N: int) -> tuple:
@@ -233,10 +359,16 @@ PYG_ATTRS_ORDER = (
 def tensors_from_brep_json_dict(
     data: dict,
     spatial_pos_max: int = 32,
+    inference_profile: InferenceProfile = "full",
+    max_edge_path_len: int = 16,
+    float16_storage: bool = False,
+    shortest_path_workers: int = 0,
 ) -> tuple[PYGGraph, list[int]]:
     """
     Build PyG ``Data`` from decoded macro JSON (**same tensors as** ``json_to_brepmfr_bin`` **then**
     ``append_angle_7th_channel`` on ``edge_data[..., 6]``).
+
+    ``inference_profile`` controls which dense pairwise tensors are stored (see module docstring).
     """
     faces, edges = data["faces"], data["edges"]
 
@@ -298,22 +430,37 @@ def tensors_from_brep_json_dict(
             flipped = np.flip(raw_pts, axis=0).copy()
             flipped[:, 3:6] *= -1.0
             edge_x[i] = flipped
-        edge_t[i] = int(eobj["t"])
-        edge_l[i] = float(eobj["l"])
-        edge_c[i] = int(eobj["c"])
-        edge_a[i] = (float(eobj["a"]) + np.pi) % (2 * np.pi) - np.pi
+        edge_t[i] = int(eobj.get("t", 0))
+        edge_l[i] = float(eobj.get("l", 0.0))
+        edge_c[i] = int(eobj.get("c", 0))
+        edge_a[i] = (float(eobj.get("a", 0.0)) + np.pi) % (2 * np.pi) - np.pi
 
     _wrap_edge_uv_angle_ch7(edge_x)
 
-    spatial_pos, edges_path = _compute_shortest_paths_edge_indices(final_src, final_dst, N)
-    d2_distance, angle_distance = _build_a2_tensors(data, face_id_to_node, N)
+    if inference_profile == "lite":
+        spatial_pos_i = None
+        edges_path_i = None
+        d2_distance = None
+        angle_distance = None
+    else:
+        spatial_pos, edges_path = _compute_shortest_paths_edge_indices(
+            final_src,
+            final_dst,
+            N,
+            max_dist=max_edge_path_len,
+            num_workers=shortest_path_workers,
+        )
+        if inference_profile == "full":
+            d2_distance, angle_distance = _build_a2_tensors(data, face_id_to_node, N)
+        else:
+            d2_distance, angle_distance = None, None
 
-    max_p = int(spatial_pos[spatial_pos < 10**8].max().item()) if N > 1 else 0
-    edges_path = edges_path[:, :, :max_p]
-    spatial_pos = spatial_pos.clamp(max=spatial_pos_max)
+        max_p = int(spatial_pos[spatial_pos < 10**8].max().item()) if N > 1 else 0
+        edges_path = edges_path[:, :, :max_p]
+        spatial_pos = spatial_pos.clamp(max=spatial_pos_max)
 
-    edges_path_i = edges_path.int()
-    spatial_pos_i = spatial_pos.int()
+        edges_path_i = edges_path.int()
+        spatial_pos_i = spatial_pos.int()
 
     # Match bin_to_pyg: out-degree equals row-sum of directed adjacency (one row per arc u->v)
     src_counts = torch.bincount(
@@ -341,12 +488,38 @@ def tensors_from_brep_json_dict(
     pyg.edge_conv = torch.from_numpy(edge_c).type(torch.int)
 
     pyg.node_degree = node_degree
-    pyg.attn_bias = torch.zeros([N + 1, N + 1], dtype=torch.float)
 
-    pyg.edge_path = edges_path_i
-    pyg.spatial_pos = spatial_pos_i
-    pyg.d2_distance = d2_distance
-    pyg.angle_distance = angle_distance
+    if inference_profile == "lite":
+        pyg.has_a1 = False
+        pyg.has_a2 = False
+        pyg.has_a3 = False
+        pyg.inference_profile = "lite"
+    elif inference_profile == "no_a2":
+        pyg.has_a1 = True
+        pyg.has_a2 = False
+        pyg.has_a3 = True
+        pyg.inference_profile = "no_a2"
+        pyg.attn_bias = torch.zeros([N + 1, N + 1], dtype=torch.float)
+        pyg.edge_path = edges_path_i
+        pyg.spatial_pos = spatial_pos_i
+    else:
+        pyg.has_a1 = True
+        pyg.has_a2 = True
+        pyg.has_a3 = True
+        pyg.inference_profile = "full"
+        pyg.attn_bias = torch.zeros([N + 1, N + 1], dtype=torch.float)
+        pyg.edge_path = edges_path_i
+        pyg.spatial_pos = spatial_pos_i
+        pyg.d2_distance = d2_distance
+        pyg.angle_distance = angle_distance
+
+    if float16_storage:
+        pyg.node_data = pyg.node_data.half()
+        pyg.edge_data = pyg.edge_data.half()
+        pyg.face_area = pyg.face_area.half()
+        pyg.store_float16 = True
+    else:
+        pyg.store_float16 = False
 
     ei = torch.stack(
         [
@@ -360,11 +533,30 @@ def tensors_from_brep_json_dict(
     return pyg, labels_list
 
 
-def build_pyg_from_json_path(json_path: Path | str, spatial_pos_max: int = 32) -> PYGGraph:
-    """Load one JSON path, set ``data_id`` from stem (fallback 0 like ``data.dgl_bin_to_pyg``)."""
+def build_pyg_from_json_path(
+    json_path: Path | str,
+    spatial_pos_max: int = 32,
+    skip_a2: bool = False,
+    inference_profile: Optional[InferenceProfile] = None,
+    max_edge_path_len: int = 16,
+    float16_storage: bool = False,
+    shortest_path_workers: int = 0,
+) -> PYGGraph:
+    """Load one JSON path, set ``data_id`` from stem (fallback 0 like ``data.dgl_bin_to_pyg``).
+
+    If ``skip_a2`` is True, it forces ``inference_profile`` to ``no_a2`` regardless of ``inference_profile``.
+    """
     json_path = Path(json_path)
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    pyg, _ = tensors_from_brep_json_dict(data, spatial_pos_max=spatial_pos_max)
+    prof: InferenceProfile = "no_a2" if skip_a2 else (inference_profile or "full")
+    pyg, _ = tensors_from_brep_json_dict(
+        data,
+        spatial_pos_max=spatial_pos_max,
+        inference_profile=prof,
+        max_edge_path_len=max_edge_path_len,
+        float16_storage=float16_storage,
+        shortest_path_workers=shortest_path_workers,
+    )
     stem = json_path.stem
     try:
         pyg.data_id = int(stem.split("_")[-1])
@@ -378,9 +570,20 @@ def convert_one_json(
     pt_out_dir: Path,
     label_out_dir: Optional[Path],
     spatial_pos_max: int = 32,
+    inference_profile: InferenceProfile = "full",
+    max_edge_path_len: int = 16,
+    float16_storage: bool = False,
+    shortest_path_workers: int = 0,
 ) -> Path:
     data = json.loads(json_path.read_text(encoding="utf-8"))
-    pyg, labels_list = tensors_from_brep_json_dict(data, spatial_pos_max=spatial_pos_max)
+    pyg, labels_list = tensors_from_brep_json_dict(
+        data,
+        spatial_pos_max=spatial_pos_max,
+        inference_profile=inference_profile,
+        max_edge_path_len=max_edge_path_len,
+        float16_storage=float16_storage,
+        shortest_path_workers=shortest_path_workers,
+    )
     file_stem = json_path.stem
     try:
         pyg.data_id = int(file_stem.split("_")[-1])
@@ -403,7 +606,38 @@ def main():
     parser.add_argument("--pt_out_dir", type=str, required=True, help="Output folder for ``.pt`` graphs")
     parser.add_argument("--label_out_dir", type=str, default=None)
     parser.add_argument("--spatial_pos_max", type=int, default=32)
+    parser.add_argument(
+        "--inference_profile",
+        type=str,
+        choices=("full", "no_a2", "lite"),
+        default="full",
+        help="full: A1+A2+A3+attn_bias; no_a2: omit dense A2; lite: omit A1/A3/attn_bias and A2 (smallest .pt).",
+    )
+    parser.add_argument(
+        "--skip_a2",
+        action="store_true",
+        help="Deprecated: same as --inference_profile no_a2 (overrides profile when set).",
+    )
+    parser.add_argument(
+        "--max_edge_path_len",
+        type=int,
+        default=16,
+        help="Max hops stored in edge_path / shortest-path BFS cap (align with collator multi_hop_max_dist).",
+    )
+    parser.add_argument(
+        "--float16_storage",
+        action="store_true",
+        help="Save node_data, edge_data, face_area as float16 (collator promotes to float32 before the encoder).",
+    )
+    parser.add_argument(
+        "--shortest_path_workers",
+        type=int,
+        default=0,
+        help="Parallel BFS sources for A1 (full/no_a2 only). 0=serial. Try 8 on large N; ignored for lite or N<64.",
+    )
     args = parser.parse_args()
+
+    profile: InferenceProfile = "no_a2" if args.skip_a2 else args.inference_profile  # type: ignore[assignment]
 
     json_dir = Path(args.json_dir)
     pt_out_dir = Path(args.pt_out_dir)
@@ -430,6 +664,10 @@ def main():
                 pt_out_dir,
                 label_out_dir,
                 spatial_pos_max=args.spatial_pos_max,
+                inference_profile=profile,
+                max_edge_path_len=args.max_edge_path_len,
+                float16_storage=args.float16_storage,
+                shortest_path_workers=args.shortest_path_workers,
             )
             ok += 1
         except Exception as e:

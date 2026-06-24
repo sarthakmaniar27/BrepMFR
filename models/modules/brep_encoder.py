@@ -53,6 +53,7 @@ class BrepEncoder(nn.Module):
         traceable: bool = False,
         q_noise: float = 0.0,
         qn_block_size: int = 8,
+        max_nodes_for_a3: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -79,6 +80,7 @@ class BrepEncoder(nn.Module):
             edge_type=edge_type,
             multi_hop_max_dist=multi_hop_max_dist,
             n_layers=num_encoder_layers,
+            max_nodes_for_a3=max_nodes_for_a3,
         )
 
         self.embed_scale = embed_scale

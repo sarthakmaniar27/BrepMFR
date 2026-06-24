@@ -1,0 +1,37 @@
+{
+  "name": "table3_full_a2_pipeline_baseline",
+  "locked_at": "2026-05-12",
+  "eval_out_root": "results/diagnostics/paper_table3_baseline_full_a2",
+  "paper_table3_metrics": {
+    "stage1_cadsynth_test": {
+      "per_face_accuracy": 0.9894,
+      "mean_per_class_accuracy": 0.9970,
+      "mean_iou": 0.9676,
+      "faces_evaluated": 274279,
+      "pt_subdir": "output/bin"
+    },
+    "stage1_mfcadpp_test_source_only": {
+      "per_face_accuracy": 0.8228,
+      "mean_per_class_accuracy": 0.7319,
+      "mean_iou": 0.6648,
+      "faces_evaluated": 267964,
+      "pt_subdir": "output/bin"
+    },
+    "stage2_mfcadpp_test_domain_adapt": {
+      "per_face_accuracy": 0.9451,
+      "mean_per_class_accuracy": 0.9095,
+      "mean_iou": 0.8674,
+      "faces_evaluated": 267964,
+      "pt_subdir": "output/bin"
+    }
+  },
+  "checkpoint_stage1": "results/stage1/ce_weighted_balanced__2026-05-04_163109/best.ckpt",
+  "checkpoint_stage2": "results/stage2/transfer_iwdan_weighted__2026-05-05_134214/best.ckpt",
+  "class_weights_alpha_stage1": 0.5,
+  "class_weights_path_canonical": "artifacts/class_weights/stage1/source_train_alpha05.json",
+  "prior_jsons_stage2_iwdan_canonical": {
+    "source": "artifacts/class_weights/stage2_iwdan/source_train_priors.json",
+    "target": "artifacts/class_weights/stage2_iwdan/target_train_priors.json"
+  },
+  "tau_sweep": "Optional; run stage2_logit_adjust_eval and attach best_tau + metrics alongside ablation rows."
+}

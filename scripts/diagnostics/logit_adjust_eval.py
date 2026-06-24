@@ -211,6 +211,14 @@ def main():
         default=0,
         help="If >0, stop after N batches per loader (smoke-test mode).",
     )
+    parser.add_argument(
+        "--pt_subdir",
+        default=None,
+        help=(
+            "Relative path under source/target roots to scan .pt graphs "
+            "(e.g. output/bin_skip_a2); omit for full-tree rglob."
+        ),
+    )
     args = parser.parse_args()
 
     out_dir = pathlib.Path(args.out_dir)
@@ -223,11 +231,15 @@ def main():
 
     # ---------------- Source priors (label counts only) --------------------
     print("\nBuilding source val dataset (priors only)")
-    src_ds = FilelistDataset(args.source_path, args.source_filelist)
+    src_ds = FilelistDataset(
+        args.source_path, args.source_filelist, args.pt_subdir
+    )
     src_loader = make_loader(src_ds, args.batch_size, args.num_workers)
 
     print("Building target val dataset")
-    tgt_ds = FilelistDataset(args.target_path, args.target_filelist)
+    tgt_ds = FilelistDataset(
+        args.target_path, args.target_filelist, args.pt_subdir
+    )
     tgt_loader = make_loader(tgt_ds, args.batch_size, args.num_workers)
 
     if args.max_batches > 0:

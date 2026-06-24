@@ -222,36 +222,38 @@ class DomainAdapt(pl.LightningModule):
         self.classifier.train()
         self.domain_adv.train()
 
-        node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)
+        with torch.profiler.record_function("brep_encoder"):
+            node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)
 
         # Split node embeddings into source and target halves -------------------
         # collator_st concatenates source graphs first, then target graphs.
         # chunk(2, dim=0) splits the batch dimension in half.
-        node_emb = node_emb[0].permute(1, 0, 2)  # [batch*2, max_node+1, dim]
-        node_emb = node_emb[:, 1:, :]            # [batch*2, max_node,   dim] — drop global virtual node
-        node_emb_s, node_emb_t = node_emb.chunk(2, dim=0)
-        padding_mask_s, padding_mask_t = batch["padding_mask"].chunk(2, dim=0)
+        with torch.profiler.record_function("pool_attn_classifier_st"):
+            node_emb = node_emb[0].permute(1, 0, 2)  # [batch*2, max_node+1, dim]
+            node_emb = node_emb[:, 1:, :]            # [batch*2, max_node,   dim] — drop global virtual node
+            node_emb_s, node_emb_t = node_emb.chunk(2, dim=0)
+            padding_mask_s, padding_mask_t = batch["padding_mask"].chunk(2, dim=0)
 
-        # Extract real (non-padded) node embeddings for source and target -------
-        node_pos_s = torch.where(padding_mask_s == False)
-        node_pos_t = torch.where(padding_mask_t == False)
-        node_z_s = node_emb_s[node_pos_s]   # [total_source_nodes, dim]
-        node_z_t = node_emb_t[node_pos_t]   # [total_target_nodes, dim]
+            # Extract real (non-padded) node embeddings for source and target -------
+            node_pos_s = torch.where(padding_mask_s == False)
+            node_pos_t = torch.where(padding_mask_t == False)
+            node_z_s = node_emb_s[node_pos_s]   # [total_source_nodes, dim]
+            node_z_t = node_emb_t[node_pos_t]   # [total_target_nodes, dim]
 
-        # Expand graph-level embedding to match per-node count ------------------
-        graph_emb_s, graph_emb_t = graph_emb.chunk(2, dim=0)
+            # Expand graph-level embedding to match per-node count ------------------
+            graph_emb_s, graph_emb_t = graph_emb.chunk(2, dim=0)
 
-        num_nodes_per_graph_s = torch.sum(~padding_mask_s, dim=-1)  # [batch]
-        graph_z_s = graph_emb_s.repeat_interleave(num_nodes_per_graph_s, dim=0).to(graph_emb.device)
-        z_s = self.attention([node_z_s, graph_z_s])
+            num_nodes_per_graph_s = torch.sum(~padding_mask_s, dim=-1)  # [batch]
+            graph_z_s = graph_emb_s.repeat_interleave(num_nodes_per_graph_s, dim=0).to(graph_emb.device)
+            z_s = self.attention([node_z_s, graph_z_s])
 
-        num_nodes_per_graph_t = torch.sum(~padding_mask_t, dim=-1)  # [batch]
-        graph_z_t = graph_emb_t.repeat_interleave(num_nodes_per_graph_t, dim=0).to(graph_emb.device)
-        z_t = self.attention([node_z_t, graph_z_t])
+            num_nodes_per_graph_t = torch.sum(~padding_mask_t, dim=-1)  # [batch]
+            graph_z_t = graph_emb_t.repeat_interleave(num_nodes_per_graph_t, dim=0).to(graph_emb.device)
+            z_t = self.attention([node_z_t, graph_z_t])
 
-        # Node classification ---------------------------------------------------
-        node_seg_s = self.classifier(z_s)  # [total_source_nodes, num_classes]
-        node_seg_t = self.classifier(z_t)  # [total_target_nodes, num_classes]
+            # Node classification ---------------------------------------------------
+            node_seg_s = self.classifier(z_s)  # [total_source_nodes, num_classes]
+            node_seg_t = self.classifier(z_t)  # [total_target_nodes, num_classes]
 
         # Source supervised classification loss — L_label -----------------------
         num_node_s = node_seg_s.size(0)
@@ -262,68 +264,71 @@ class DomainAdapt(pl.LightningModule):
             f"!= {batch['label_feature'].shape[0]}"
         )
 
-        label_s = batch["label_feature"][:num_node_s].long()
-        label_s_onehot = F.one_hot(label_s, self.num_classes)
-        loss_s = CrossEntropyLoss(label_s_onehot, node_seg_s)
-        self.log("train_loss_s", loss_s, on_step=False, on_epoch=True)
+        with torch.profiler.record_function("loss_cls_entropy"):
+            label_s = batch["label_feature"][:num_node_s].long()
+            label_s_onehot = F.one_hot(label_s, self.num_classes)
+            loss_s = CrossEntropyLoss(label_s_onehot, node_seg_s)
+            self.log("train_loss_s", loss_s, on_step=False, on_epoch=True)
 
-        # Target entropy minimisation loss — L_entropy --------------------------
-        # Target labels are NOT used here. EntropyLoss operates on predictions only.
-        label_t = batch["label_feature"][num_node_s:].long()  # kept for monitoring only
-        loss_t = EntropyLoss(node_seg_t)
-        self.log("train_loss_t", loss_t, on_step=False, on_epoch=True)
+            # Target entropy minimisation loss — L_entropy --------------------------
+            # Target labels are NOT used here. EntropyLoss operates on predictions only.
+            label_t = batch["label_feature"][num_node_s:].long()  # kept for monitoring only
+            loss_t = EntropyLoss(node_seg_t)
+            self.log("train_loss_t", loss_t, on_step=False, on_epoch=True)
 
         # Domain adversarial loss — L_adv ---------------------------------------
         # Pad shorter side with zeros and use weight masks so padding nodes
         # do not contribute to the discriminator loss.
-        max_num_node = max(num_node_s, num_node_t)
-        pad_s = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_s))
-        pad_t = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_t))
-        z_s_ = pad_s(z_s)
-        z_t_ = pad_t(z_t)
-        weight_s = torch.zeros(max_num_node, device=z_s.device, dtype=z_s.dtype)
-        if self.iwdan_enabled:
-            # IWDAN: instead of all-ones on real source nodes, use per-class
-            # importance weight P_T(y)/P_S(y). label_s is in [0, num_classes).
-            iw = self.iwdan_weights.to(device=z_s.device, dtype=z_s.dtype)
-            weight_s[:num_node_s] = iw[label_s]
-        else:
-            weight_s[:num_node_s] = 1.0
-        weight_t = torch.zeros(max_num_node, device=z_t.device, dtype=z_t.dtype)
-        weight_t[:num_node_t] = 1.0
-        loss_adv = self.domain_adv(z_s_, z_t_, weight_s, weight_t)
+        with torch.profiler.record_function("domain_adv"):
+            max_num_node = max(num_node_s, num_node_t)
+            pad_s = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_s))
+            pad_t = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_t))
+            z_s_ = pad_s(z_s)
+            z_t_ = pad_t(z_t)
+            weight_s = torch.zeros(max_num_node, device=z_s.device, dtype=z_s.dtype)
+            if self.iwdan_enabled:
+                # IWDAN: instead of all-ones on real source nodes, use per-class
+                # importance weight P_T(y)/P_S(y). label_s is in [0, num_classes).
+                iw = self.iwdan_weights.to(device=z_s.device, dtype=z_s.dtype)
+                weight_s[:num_node_s] = iw[label_s]
+            else:
+                weight_s[:num_node_s] = 1.0
+            weight_t = torch.zeros(max_num_node, device=z_t.device, dtype=z_t.dtype)
+            weight_t[:num_node_t] = 1.0
+            loss_adv = self.domain_adv(z_s_, z_t_, weight_s, weight_t)
 
-        # Log GRL lambda each epoch for TensorBoard monitoring (matches authors'
-        # default GRL: alpha=1, max_iters=1000, auto_step=True).
-        grl = self.domain_adv.grl
-        p = grl.iter_num / grl.max_iters
-        lam = float(
-            2.0 * (grl.hi - grl.lo) / (1.0 + np.exp(-grl.alpha * p))
-            - (grl.hi - grl.lo) + grl.lo
-        )
-        self.log("grl_lambda", lam, on_step=False, on_epoch=True)
+            # Log GRL lambda each epoch for TensorBoard monitoring (matches authors'
+            # default GRL: alpha=1, max_iters=1000, auto_step=True).
+            grl = self.domain_adv.grl
+            p = grl.iter_num / grl.max_iters
+            lam = float(
+                2.0 * (grl.hi - grl.lo) / (1.0 + np.exp(-grl.alpha * p))
+                - (grl.hi - grl.lo) + grl.lo
+            )
+            self.log("grl_lambda", lam, on_step=False, on_epoch=True)
 
-        domain_acc = self.domain_adv.domain_discriminator_accuracy
-        self.log("train_loss_transfer", loss_adv, on_step=False, on_epoch=True)
-        self.log("train_transfer_acc", domain_acc, on_step=False, on_epoch=True)
+            domain_acc = self.domain_adv.domain_discriminator_accuracy
+            self.log("train_loss_transfer", loss_adv, on_step=False, on_epoch=True)
+            self.log("train_transfer_acc", domain_acc, on_step=False, on_epoch=True)
 
         # Per-face accuracy monitoring (source and target) ----------------------
-        pred_s = torch.argmax(node_seg_s, dim=-1)
-        pred_s_np = pred_s.long().detach().cpu().numpy()
-        label_s_np = label_s.long().detach().cpu().numpy()
-        per_face_comp_s = (pred_s_np == label_s_np).astype(np.int64)
-        self.log("train_acc_s", np.mean(per_face_comp_s), on_step=True, on_epoch=True)
+        with torch.profiler.record_function("loss_total"):
+            pred_s = torch.argmax(node_seg_s, dim=-1)
+            pred_s_np = pred_s.long().detach().cpu().numpy()
+            label_s_np = label_s.long().detach().cpu().numpy()
+            per_face_comp_s = (pred_s_np == label_s_np).astype(np.int64)
+            self.log("train_acc_s", np.mean(per_face_comp_s), on_step=True, on_epoch=True)
 
-        pred_t = torch.argmax(node_seg_t, dim=-1)
-        known_pos = torch.where(label_t < self.num_classes)
-        label_t_np = label_t[known_pos].long().detach().cpu().numpy()
-        pred_t_np = pred_t[known_pos].long().detach().cpu().numpy()
-        per_face_comp_t = (pred_t_np == label_t_np).astype(np.int64)
-        self.log("train_acc_t", np.mean(per_face_comp_t), on_step=True, on_epoch=True)
+            pred_t = torch.argmax(node_seg_t, dim=-1)
+            known_pos = torch.where(label_t < self.num_classes)
+            label_t_np = label_t[known_pos].long().detach().cpu().numpy()
+            pred_t_np = pred_t[known_pos].long().detach().cpu().numpy()
+            per_face_comp_t = (pred_t_np == label_t_np).astype(np.int64)
+            self.log("train_acc_t", np.mean(per_face_comp_t), on_step=True, on_epoch=True)
 
-        # Joint loss — paper values: α=0.1, β=0.3 ------------------------------
-        loss = loss_s + 0.3 * loss_adv + 0.1 * loss_t
-        self.log("train_loss", loss, on_step=False, on_epoch=True)
+            # Joint loss — paper values: α=0.1, β=0.3 ------------------------------
+            loss = loss_s + 0.3 * loss_adv + 0.1 * loss_t
+            self.log("train_loss", loss, on_step=False, on_epoch=True)
         return loss
 
     def on_train_epoch_end(self):
@@ -343,30 +348,32 @@ class DomainAdapt(pl.LightningModule):
         self.classifier.eval()
         self.domain_adv.eval()
 
-        node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)
+        with torch.profiler.record_function("brep_encoder"):
+            node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)
 
-        node_emb = node_emb[0].permute(1, 0, 2)
-        node_emb = node_emb[:, 1:, :]
-        node_emb_s, node_emb_t = node_emb.chunk(2, dim=0)
-        padding_mask_s, padding_mask_t = batch["padding_mask"].chunk(2, dim=0)
+        with torch.profiler.record_function("pool_attn_classifier_st"):
+            node_emb = node_emb[0].permute(1, 0, 2)
+            node_emb = node_emb[:, 1:, :]
+            node_emb_s, node_emb_t = node_emb.chunk(2, dim=0)
+            padding_mask_s, padding_mask_t = batch["padding_mask"].chunk(2, dim=0)
 
-        node_pos_s = torch.where(padding_mask_s == False)
-        node_pos_t = torch.where(padding_mask_t == False)
-        node_z_s = node_emb_s[node_pos_s]
-        node_z_t = node_emb_t[node_pos_t]
+            node_pos_s = torch.where(padding_mask_s == False)
+            node_pos_t = torch.where(padding_mask_t == False)
+            node_z_s = node_emb_s[node_pos_s]
+            node_z_t = node_emb_t[node_pos_t]
 
-        graph_emb_s, graph_emb_t = graph_emb.chunk(2, dim=0)
+            graph_emb_s, graph_emb_t = graph_emb.chunk(2, dim=0)
 
-        num_nodes_per_graph_s = torch.sum(~padding_mask_s, dim=-1)
-        graph_z_s = graph_emb_s.repeat_interleave(num_nodes_per_graph_s, dim=0).to(self.device)
-        z_s = self.attention([node_z_s, graph_z_s])
+            num_nodes_per_graph_s = torch.sum(~padding_mask_s, dim=-1)
+            graph_z_s = graph_emb_s.repeat_interleave(num_nodes_per_graph_s, dim=0).to(self.device)
+            z_s = self.attention([node_z_s, graph_z_s])
 
-        num_nodes_per_graph_t = torch.sum(~padding_mask_t, dim=-1)
-        graph_z_t = graph_emb_t.repeat_interleave(num_nodes_per_graph_t, dim=0).to(self.device)
-        z_t = self.attention([node_z_t, graph_z_t])
+            num_nodes_per_graph_t = torch.sum(~padding_mask_t, dim=-1)
+            graph_z_t = graph_emb_t.repeat_interleave(num_nodes_per_graph_t, dim=0).to(self.device)
+            z_t = self.attention([node_z_t, graph_z_t])
 
-        node_seg_s = self.classifier(z_s)
-        node_seg_t = self.classifier(z_t)
+            node_seg_s = self.classifier(z_s)
+            node_seg_t = self.classifier(z_t)
 
         num_node_s = node_seg_s.size(0)
         num_node_t = node_seg_t.size(0)
@@ -376,42 +383,39 @@ class DomainAdapt(pl.LightningModule):
             f"!= {batch['label_feature'].shape[0]}"
         )
 
-        label_s = batch["label_feature"][:num_node_s].long()
-        label_t = batch["label_feature"][num_node_s:num_node_s + num_node_t].long()
+        with torch.profiler.record_function("val_loss_terms"):
+            label_s = batch["label_feature"][:num_node_s].long()
+            label_t = batch["label_feature"][num_node_s:num_node_s + num_node_t].long()
 
-        label_s_onehot = F.one_hot(label_s, self.num_classes)
-        loss_s = CrossEntropyLoss(label_s_onehot, node_seg_s)
-        loss_t = EntropyLoss(node_seg_t)
+            label_s_onehot = F.one_hot(label_s, self.num_classes)
+            loss_s = CrossEntropyLoss(label_s_onehot, node_seg_s)
+            loss_t = EntropyLoss(node_seg_t)
 
-        self.log("eval_loss_s", loss_s, on_step=False, on_epoch=True)
-        self.log("eval_loss_t", loss_t, on_step=False, on_epoch=True)
+            self.log("eval_loss_s", loss_s, on_step=False, on_epoch=True)
+            self.log("eval_loss_t", loss_t, on_step=False, on_epoch=True)
 
-        # Compute adversarial loss for monitoring only (GRL is not stepped here)
-        max_num_node = max(num_node_s, num_node_t)
-        pad_s = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_s))
-        pad_t = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_t))
-        z_s_ = pad_s(z_s)
-        z_t_ = pad_t(z_t)
-        weight_s = torch.zeros(max_num_node, device=z_s.device, dtype=z_s.dtype)
-        weight_s[:num_node_s] = 1.0
-        weight_t = torch.zeros(max_num_node, device=z_t.device, dtype=z_t.dtype)
-        weight_t[:num_node_t] = 1.0
-        loss_adv = self.domain_adv(z_s_, z_t_, weight_s, weight_t)
-        self.log("eval_loss_transfer", loss_adv, on_step=False, on_epoch=True)
+            # Compute adversarial loss for monitoring only (GRL is not stepped here)
+            max_num_node = max(num_node_s, num_node_t)
+            pad_s = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_s))
+            pad_t = nn.ZeroPad2d((0, 0, 0, max_num_node - num_node_t))
+            z_s_ = pad_s(z_s)
+            z_t_ = pad_t(z_t)
+            weight_s = torch.zeros(max_num_node, device=z_s.device, dtype=z_s.dtype)
+            weight_s[:num_node_s] = 1.0
+            weight_t = torch.zeros(max_num_node, device=z_t.device, dtype=z_t.dtype)
+            weight_t[:num_node_t] = 1.0
+            loss_adv = self.domain_adv(z_s_, z_t_, weight_s, weight_t)
+            self.log("eval_loss_transfer", loss_adv, on_step=False, on_epoch=True)
 
-        # eval_loss = 1 / target_accuracy.
-        # This converts the maximisation objective (accuracy) into a minimisation
-        # objective so that ModelCheckpoint(monitor="eval_loss") with mode="min"
-        # saves the checkpoint when target accuracy is highest.
-        # The scheduler also monitors this signal with mode="min".
-        pred_t_val = torch.argmax(node_seg_t, dim=-1)
-        known_pos_val = torch.where(label_t < self.num_classes)
-        label_t_known_val = label_t[known_pos_val].long().detach().cpu().numpy()
-        pred_t_known_val = pred_t_val[known_pos_val].long().detach().cpu().numpy()
-        per_face_comp_val = (pred_t_known_val == label_t_known_val).astype(np.int64)
-        target_acc = float(np.mean(per_face_comp_val))
-        eval_loss = 1.0 / (target_acc + 1e-9)
-        self.log("eval_loss", eval_loss, on_step=False, on_epoch=True)
+            # eval_loss = 1 / target_accuracy.
+            pred_t_val = torch.argmax(node_seg_t, dim=-1)
+            known_pos_val = torch.where(label_t < self.num_classes)
+            label_t_known_val = label_t[known_pos_val].long().detach().cpu().numpy()
+            pred_t_known_val = pred_t_val[known_pos_val].long().detach().cpu().numpy()
+            per_face_comp_val = (pred_t_known_val == label_t_known_val).astype(np.int64)
+            target_acc = float(np.mean(per_face_comp_val))
+            eval_loss = 1.0 / (target_acc + 1e-9)
+            self.log("eval_loss", eval_loss, on_step=False, on_epoch=True)
 
         # Accumulate predictions for epoch-end accuracy computation -------------
         pred_s = torch.argmax(node_seg_s, dim=-1)
@@ -430,6 +434,21 @@ class DomainAdapt(pl.LightningModule):
             self.pred_t.append(v)
         for v in label_t_np:
             self.label_t.append(v)
+
+        if (
+            batch_idx == 0
+            and self.trainer.current_epoch % 5 == 0
+            and self.trainer.is_global_zero
+        ):
+            from models.tensorboard_media import tb_add_histogram
+
+            mx = node_seg_t.max(dim=-1).values.detach().cpu()
+            tb_add_histogram(
+                self.trainer,
+                "val/target_max_pred_prob_batch0",
+                mx,
+                int(self.trainer.global_step),
+            )
 
         return eval_loss
 
@@ -469,8 +488,54 @@ class DomainAdapt(pl.LightningModule):
                 per_class_acc.append(np.mean(per_face_comp))
                 print("class_%s_acc: %s" % (i + 1, np.mean(per_face_comp)))
         print("per_class_accuracy: %s" % np.mean(per_class_acc))
+        if len(per_class_acc) > 0:
+            self.log("per_class_accuracy", float(np.mean(per_class_acc)))
 
-    # -------------------------------------------------------------------------
+        per_class_iou = []
+        for i in range(0, self.num_classes):
+            label_pos = np.where(label_t_np == i)[0]
+            pred_pos = np.where(pred_t_np == i)[0]
+            if len(pred_pos) > 0 and len(label_pos) > 0:
+                class_i_preds = pred_t_np[label_pos]
+                class_i_label = label_t_np[label_pos]
+                Intersection = (class_i_preds == class_i_label).astype(np.int64)
+                Union = (class_i_preds != class_i_label).astype(np.int64)
+                class_i_preds_ = pred_t_np[pred_pos]
+                class_i_label_ = label_t_np[pred_pos]
+                Union_ = (class_i_preds_ != class_i_label_).astype(np.int64)
+                per_class_iou.append(
+                    float(
+                        np.sum(Intersection)
+                        / (
+                            np.sum(Union)
+                            + np.sum(Intersection)
+                            + np.sum(Union_)
+                            + 1e-9
+                        )
+                    )
+                )
+        if len(per_class_iou) > 0:
+            self.log("IoU", float(np.mean(per_class_iou)))
+
+        if self.trainer.is_global_zero:
+            from models.tensorboard_media import log_segmentation_val_media
+
+            log_segmentation_val_media(
+                self.trainer,
+                pred_s_np,
+                label_s_np,
+                self.num_classes,
+                int(self.current_epoch),
+                prefix="val/source",
+            )
+            log_segmentation_val_media(
+                self.trainer,
+                pred_t_np,
+                label_t_np,
+                self.num_classes,
+                int(self.current_epoch),
+                prefix="val/target",
+            )
     # Test
     # -------------------------------------------------------------------------
 

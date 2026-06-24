@@ -5,6 +5,7 @@
 #   pip install torch-geometric==2.7.0
 #
 # Ingest workflow: SolidWorks macro JSON → .pt (+ labels) with `scripts/inference/json_to_brepmfr_pyg.py` (no DGL).
+# Profiles (full / no_a2 / lite): see `docs/inference_profiles.md`.
 # Optional one-time legacy corpus: migrate old .bin → .pt with `scripts/inference/convert_dgl_bins_to_pyg.py`
 # using a conda env where `dgl` matches how those .bin files were written.
 
@@ -29,3 +30,10 @@ dependencies:
     - prettytable
     - tqdm
     - "numpy>=1.23,<2"
+    - matplotlib
+    - networkx
+    - pyvis
+    - wandb
+    - optuna
+    - torchinfo
+    - Pillow

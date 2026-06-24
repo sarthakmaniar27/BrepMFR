@@ -1,0 +1,62 @@
+{
+  "name": "stage1_ce_weighted_balanced_full_a2",
+  "locked_at": "2026-05-06",
+  "hyperparameters_recorded_from": "results/logs/stage1/ce_weighted_balanced__2026-05-04_163109/hparams.yaml",
+  "notes": [
+    "Full geometry encodings (standard A2 tensors). Not the zero-A2 / bin_skip_a2 ablation.",
+    "TensorBoard upgrades: LR monitor, meta/* via TrainingMetaLoggerCallback, confusion/IW visuals from tensorboard_media, optional CSV/W&B under results/logs/.",
+    "Do not overwrite this run; copy to a new run_name when retraining.",
+    "A2 ablation: same CLI as mirrored_train_args below plus --pt_subdir output/bin_skip_a2 and a new --run_name only."
+  ],
+  "train_entrypoint": "segmentation.py train",
+  "checkpoint_best": "results/stage1/ce_weighted_balanced__2026-05-04_163109/best.ckpt",
+  "run_name": "ce_weighted_balanced__2026-05-04_163109",
+  "tensorboard_events_glob_legacy": "results/stage1/ce_weighted_balanced__2026-05-04_163109/events.out.tfevents* (top-level TB file; relocated 2026-05)",
+  "tensorboard_events_glob_after_logs_split": "results/logs/stage1/ce_weighted_balanced__2026-05-04_163109/tensorboard/**/events.out.tfevents*",
+  "baseline_dataset_path_recorded": "Z:/Experiment6_PyG/source_dataset",
+  "class_weights_path_as_logged_in_run": "results/class_weights/source_train_alpha05.json",
+  "class_weights_path_repo_canonical_now": "artifacts/class_weights/stage1/source_train_alpha05.json",
+  "mirrored_train_args": {
+    "dataset": "cadsynth",
+    "dataset_path": "Z:/Experiment6_PyG/source_dataset",
+    "num_classes": 25,
+    "batch_size": 32,
+    "max_epochs": 100,
+    "num_workers": 4,
+    "log_every_n_steps": 50,
+    "dropout": 0.3,
+    "attention_dropout": 0.3,
+    "act_dropout": 0.3,
+    "d_model": 512,
+    "dim_node": 256,
+    "n_heads": 32,
+    "n_layers_encode": 8,
+    "warmup_freeze_epochs": 3,
+    "pt_subdir_full_a2": null
+  },
+  "representative_locked_command_stage1_full_a2": [
+    "python segmentation.py train",
+    "--dataset_path Z:/Experiment6_PyG/source_dataset",
+    "--class_weights_path artifacts/class_weights/stage1/source_train_alpha05.json",
+    "--batch_size 32",
+    "--max_epochs 100",
+    "--num_workers 4",
+    "--log_every_n_steps 50",
+    "--dropout 0.3 --attention_dropout 0.3 --act-dropout 0.3",
+    "--d_model 512 --dim_node 256 --n_heads 32 --n_layers_encode 8 --warmup_freeze_epochs 3 --num_classes 25",
+    "--run_name ce_weighted_balanced__frozen_copy__<slug>"
+  ],
+  "representative_locked_command_stage1_zero_a2_ablation_same_as_baseline_but_subdir_runname": [
+    "python segmentation.py train",
+    "--dataset_path Z:/Experiment6_PyG/source_dataset",
+    "--pt_subdir output/bin_skip_a2",
+    "--class_weights_path artifacts/class_weights/stage1/source_train_alpha05.json",
+    "--batch_size 32",
+    "--max_epochs 100",
+    "--num_workers 4",
+    "--log_every_n_steps 50",
+    "--dropout 0.3 --attention_dropout 0.3 --act-dropout 0.3",
+    "--d_model 512 --dim_node 256 --n_heads 32 --n_layers_encode 8 --warmup_freeze_epochs 3 --num_classes 25",
+    "--run_name ce_weighted_balanced_skip_a2__<slug>"
+  ]
+}

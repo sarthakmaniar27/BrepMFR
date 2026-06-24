@@ -1,0 +1,20 @@
+{
+  "method": "inv_freq_pow",
+  "alpha": 0.5,
+  "num_classes": 2,
+  "num_samples": 27625,
+  "total_faces": 2646482,
+  "weight_min": 0.1,
+  "weight_max": 20.0,
+  "counts": [
+    1578970,
+    1067512
+  ],
+  "weights": [
+    0.9024506937163971,
+    1.097549306283603
+  ],
+  "computed_from": "D:\\threads\\lite",
+  "split_file": "train.txt",
+  "computed_at": "2026-05-26T22:37:11"
+}

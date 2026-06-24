@@ -102,9 +102,16 @@ def _move_batch_to_device(batch, device):
     }
 
 
-def count_labels_filelist(root: str, filelist: str, num_classes: int, batch_size: int, num_workers: int):
+def count_labels_filelist(
+    root: str,
+    filelist: str,
+    num_classes: int,
+    batch_size: int,
+    num_workers: int,
+    pt_subdir: str | None = None,
+):
     """Count face labels using label-only path via FilelistDataset batches."""
-    ds = FilelistDataset(root, filelist)
+    ds = FilelistDataset(root, filelist, pt_subdir)
     loader = make_loader(ds, batch_size, num_workers)
     counts = np.zeros(num_classes, dtype=np.int64)
     for batch in tqdm(loader, desc=f"count {filelist}", dynamic_ncols=True):
@@ -227,6 +234,13 @@ def main():
     )
     ap.add_argument("--out_dir", default="results/diagnostics/stage2_logit_adjust")
     ap.add_argument("--max_batches", type=int, default=0, help="If >0, truncates infer (smoke test).")
+    ap.add_argument(
+        "--pt_subdir",
+        default=None,
+        help=(
+            "Relative subgraph dir under source/target roots (e.g. output/bin_skip_a2)."
+        ),
+    )
     args = ap.parse_args()
 
     out_dir = pathlib.Path(args.out_dir)
@@ -243,12 +257,22 @@ def main():
     # --- Priors: source from filelist; target empirical on same split we evaluate ---
     print("\nCounting source priors:", args.source_prior_filelist)
     src_counts = count_labels_filelist(
-        args.source_path, args.source_prior_filelist, args.num_classes, args.batch_size, args.num_workers
+        args.source_path,
+        args.source_prior_filelist,
+        args.num_classes,
+        args.batch_size,
+        args.num_workers,
+        args.pt_subdir,
     )
     tgt_filelist = "t_val.txt" if args.target_split == "val" else "t_test.txt"
     print("Counting target priors (same split as infer):", tgt_filelist)
     tgt_counts = count_labels_filelist(
-        args.target_path, tgt_filelist, args.num_classes, args.batch_size, args.num_workers
+        args.target_path,
+        tgt_filelist,
+        args.num_classes,
+        args.batch_size,
+        args.num_workers,
+        args.pt_subdir,
     )
 
     src_priors = priors_from_counts(src_counts)
@@ -264,6 +288,7 @@ def main():
         random_rotate=False,
         num_class=args.num_classes,
         open_set=0,
+        pt_subdir=args.pt_subdir,
     )
     dl_kw = _dataloader_kw(args.num_workers)
     dl_kw["drop_last"] = False

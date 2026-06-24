@@ -122,6 +122,7 @@ def _namespace_from_ckpt(ckpt: Dict[str, Any]) -> Namespace:
 def load_brepseg_for_inference(
     ckpt_path: pathlib.Path,
     device: torch.device,
+    max_nodes_for_a3: Optional[int] = 768,
 ) -> Tuple[BrepSeg, int]:
     """
     Build BrepSeg and load segmentation weights from either BrepSeg or DomainAdapt ckpt.
@@ -136,6 +137,11 @@ def load_brepseg_for_inference(
     cw = getattr(args, "class_weights_path", None)
     if cw and not pathlib.Path(cw).is_file():
         args.class_weights_path = None
+
+    if max_nodes_for_a3 is not None and max_nodes_for_a3 <= 0:
+        args.max_nodes_for_a3 = None
+    else:
+        args.max_nodes_for_a3 = max_nodes_for_a3
 
     num_classes = int(getattr(args, "num_classes", 25))
     model = BrepSeg(args)
@@ -222,6 +228,12 @@ def main() -> None:
         default=5,
         help="When not --all-proclasses, show this many classes per line",
     )
+    ap.add_argument(
+        "--max_nodes_for_a3",
+        type=int,
+        default=768,
+        help="Cap A3 multi-hop edge bias for huge graphs (0 = no cap). See run_pyg_inference.",
+    )
     args = ap.parse_args()
 
     if args.graph is None and args.step is None:
@@ -247,7 +259,9 @@ def main() -> None:
         if pyg is None:
             raise RuntimeError(f"No solids read from STEP: {step_path}")
 
-    model, num_classes = load_brepseg_for_inference(args.checkpoint.resolve(), device)
+    model, num_classes = load_brepseg_for_inference(
+        args.checkpoint.resolve(), device, int(args.max_nodes_for_a3)
+    )
     if num_classes != len(CLASS_NAMES):
         print(
             f"Warning: model num_classes={num_classes} vs built-in names {len(CLASS_NAMES)}",

@@ -17,8 +17,14 @@ Optional overrides::
   python scripts/inference/run_pyg_inference.py --checkpoint model.ckpt --device cpu --batch_size 4 ^
     --dataset_root Z:\\new_dataset\\test --only abc
 
+**Arbitrary PyG folder** (lite / no_a2 caches next to ``labels/``)::
+
+  python scripts/inference/run_pyg_inference.py --checkpoint results/.../best.ckpt ^
+    --pyg_dir Y:\\new_dataset\\test\\abc\\abc_brepmfr_test_inference\\pyg_lite ^
+    --inference_dir Y:\\new_dataset\\test\\abc\\abc_brepmfr_test_inference\\inference_lite
+
 After CSVs exist, export predicted-label UV JSON (``uv_json_pred``) with
-``python scripts/inference/export_uv_json_pred.py --dataset_root ...`` (reads ``inference/*.csv``).
+``export_uv_json_pred.py`` (``--dataset_root`` layout **or** ``--pyg_dir``; see that script).
 """
 
 from __future__ import annotations
@@ -81,7 +87,7 @@ FACE_LABEL_NAME = {
     21: "Circular end pocket",
     22: "O-ring",
     23: "Blind hole",
-    24: "Fillet",
+    24: "Round",
 }
 
 
@@ -104,6 +110,7 @@ def _namespace_from_ckpt(ckpt: Dict[str, Any]) -> Namespace:
 def load_brepseg_for_inference(
     ckpt_path: pathlib.Path,
     device: torch.device,
+    max_nodes_for_a3: Optional[int] = 768,
 ) -> Tuple[BrepSeg, int]:
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     if "state_dict" not in ckpt:
@@ -115,6 +122,11 @@ def load_brepseg_for_inference(
     cw = getattr(args, "class_weights_path", None)
     if cw and not pathlib.Path(cw).is_file():
         args.class_weights_path = None
+
+    if max_nodes_for_a3 is not None and max_nodes_for_a3 <= 0:
+        args.max_nodes_for_a3 = None
+    else:
+        args.max_nodes_for_a3 = max_nodes_for_a3
 
     num_classes = int(getattr(args, "num_classes", 25))
     model = BrepSeg(args)
@@ -321,6 +333,12 @@ def inference_one_dataset(
         nonlocal graphs_written
         if not batch_pygs:
             return
+        if sum(_num_faces(g) for g in batch_pygs) == 0:
+            print(f"[skip] batch has zero total faces: {[p.name for p in batch_paths]}")
+            batch_paths = []
+            batch_pygs = []
+            batch_gt = []
+            return
         b = collator(batch_pygs, multi_hop_max_dist, spatial_pos_max)
         b = _batch_to_device(b, device)
         probs_t = predict_probs_per_node(model, b, num_classes)
@@ -351,6 +369,9 @@ def inference_one_dataset(
             continue
         if not hasattr(pyg, "edge_index") or not hasattr(pyg, "node_data"):
             print(f"[skip] not BrepMFR PyG layout: {pt_path}")
+            continue
+        if _num_faces(pyg) == 0:
+            print(f"[skip] zero faces (empty node_data): {pt_path}")
             continue
 
         gt = _resolve_gt(pyg, pt_path.stem, graph_parent, num_classes)
@@ -398,6 +419,7 @@ def main() -> None:
         "--multi_hop_max_dist",
         type=int,
         default=16,
+        help="Collator hop cap; match json_to_brepmfr_pyg --max_edge_path_len when building .pt.",
     )
     ap.add_argument(
         "--spatial_pos_max",
@@ -405,13 +427,77 @@ def main() -> None:
         default=32,
     )
     ap.add_argument(
+        "--max_nodes_for_a3",
+        type=int,
+        default=768,
+        help="Skip Graphormer multi-hop edge bias (A3) when padded node count exceeds this "
+        "(avoids O(n^2×hop) GPU OOM on huge face graphs). Use 0 for no cap. Default: 768.",
+    )
+    ap.add_argument(
         "--max_files",
         type=int,
         default=None,
         help="Max .pt files per dataset (debug).",
     )
+    ap.add_argument(
+        "--pyg_dir",
+        type=pathlib.Path,
+        default=None,
+        help="Run on a single folder of *.pt (overrides --dataset_root / --only). "
+        "Use with lite or no_a2 graphs; set --inference_dir if you want CSVs next to a non-default path.",
+    )
+    ap.add_argument(
+        "--inference_dir",
+        type=pathlib.Path,
+        default=None,
+        help="CSV output directory when using --pyg_dir (default: <parent of pyg_dir>/inference).",
+    )
 
     args = ap.parse_args()
+
+    if args.pyg_dir is not None:
+        pyg_dir = args.pyg_dir.expanduser().resolve()
+        if not pyg_dir.is_dir():
+            raise SystemExit(f"--pyg_dir is not a directory: {pyg_dir}")
+        infer_dir = (
+            args.inference_dir.expanduser().resolve()
+            if args.inference_dir is not None
+            else (pyg_dir.parent / "inference")
+        )
+
+        device = torch.device(args.device)
+        if args.device.startswith("cuda") and not torch.cuda.is_available():
+            print("CUDA unavailable; using CPU.", flush=True)
+            device = torch.device("cpu")
+
+        ckpt_path = args.checkpoint.resolve()
+        model, num_classes = load_brepseg_for_inference(
+            ckpt_path, device, int(args.max_nodes_for_a3)
+        )
+        print(f"Loaded segmentation head num_classes={num_classes} from {ckpt_path}", flush=True)
+
+        n_found, n_graph, n_face, mean_acc = inference_one_dataset(
+            name="pyg_dir",
+            pyg_dir=pyg_dir,
+            inference_out=infer_dir,
+            device=device,
+            batch_size=max(1, int(args.batch_size)),
+            multi_hop_max_dist=args.multi_hop_max_dist,
+            spatial_pos_max=args.spatial_pos_max,
+            model=model,
+            num_classes=num_classes,
+            max_files=args.max_files,
+        )
+        extra = ""
+        if mean_acc is not None:
+            extra = f"  top1 (faces with GT)={100.0 * mean_acc:.2f}%"
+        print(
+            f"pyg_dir={pyg_dir}: pt_candidates={n_found} graphs_ok={n_graph} "
+            f"total_faces_written={n_face}{extra}\nCSV -> {infer_dir}",
+            flush=True,
+        )
+        return
+
     sets = {"cadsynth", "mfcadpp", "abc"}
     if args.only:
         sel = {x.strip().lower() for x in args.only.split(",") if x.strip()}
@@ -428,7 +514,9 @@ def main() -> None:
         device = torch.device("cpu")
 
     ckpt_path = args.checkpoint.resolve()
-    model, num_classes = load_brepseg_for_inference(ckpt_path, device)
+    model, num_classes = load_brepseg_for_inference(
+        ckpt_path, device, int(args.max_nodes_for_a3)
+    )
     print(f"Loaded segmentation head num_classes={num_classes} from {ckpt_path}", flush=True)
 
     nc_names = len(FACE_LABEL_NAME)

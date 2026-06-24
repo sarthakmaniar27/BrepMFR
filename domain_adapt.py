@@ -1,4 +1,44 @@
 # -*- coding: utf-8 -*-
+import os
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import warnings
+
+
+def _silence_known_third_party_warnings() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=".*pkg_resources is deprecated.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        module=r"google\.api_core",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        module=r"google\.cloud",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=".*infer the `batch_size` from an ambiguous collection.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=".*does not have many workers.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*persistent_workers=True.*",
+        module=r"pytorch_lightning\.trainer\.connectors\.data_connector",
+    )
+
+
+_silence_known_third_party_warnings()
+
 import argparse
 import pathlib
 import re
@@ -7,8 +47,12 @@ from datetime import datetime
 import torch
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
 
+from callbacks.training_logging import (
+    build_loggers,
+    build_pytorch_profiler,
+    build_train_callbacks,
+)
 from models.transfer_model import DomainAdapt
 from data.dataset import TransferDataset
 from models.modules.utils.macro import *
@@ -42,6 +86,25 @@ def main():
             "collator in parallel while the GPU processes the previous batch. "
             "On Windows, huge batches can hit error 1455 (page file); try 2 or 0 if that happens."
         ),
+    )
+    parser.add_argument(
+        "--pin_memory",
+        action="store_true",
+        help=(
+            "DataLoader pin_memory=True (faster staging to GPU when CUDA; slightly more host RAM)."
+        ),
+    )
+    parser.add_argument(
+        "--dataloader_prefetch_factor",
+        type=int,
+        default=None,
+        metavar="N",
+        help="DataLoader prefetch_factor when num_workers>0 (default: 1). Try 2 or 4 if GPU idles.",
+    )
+    parser.add_argument(
+        "--cuda_launch_blocking",
+        action="store_true",
+        help="Set CUDA_LAUNCH_BLOCKING=1 (CUDA debugging only — large slowdown).",
     )
     parser.add_argument(
         "--pre_train",
@@ -138,8 +201,82 @@ def main():
         default=10.0,
         help="Clip per-class IW ratio to [1/clip, clip] for stability.",
     )
+    parser.add_argument(
+        "--pt_subdir",
+        type=str,
+        default=None,
+        help=(
+            "Load graphs only under `<source_path>/<pt_subdir>` and `<target_path>/<pt_subdir>`. "
+            "Example: `output/bin_skip_a2`."
+        ),
+    )
+    parser.add_argument(
+        "--use_wandb",
+        action="store_true",
+        help="Also log to Weights & Biases (requires pip install wandb).",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default=None,
+        help="W&B project name (default: brepmfr-pyg).",
+    )
+    parser.add_argument(
+        "--csv_log",
+        action="store_true",
+        help=(
+            "Also write Lightning CSVLogger metrics under "
+            "results/logs/stage2/<run_name>/csv_metrics/."
+        ),
+    )
+    parser.add_argument(
+        "--limit_train_batches",
+        type=int,
+        default=None,
+        help="Caps training batches each epoch (Lightning). Use ~2–5 with --max_epochs 1 for smoke runs.",
+    )
+    parser.add_argument(
+        "--limit_val_batches",
+        type=int,
+        default=None,
+        help="Caps validation batches each epoch (Lightning).",
+    )
+    parser.add_argument(
+        "--tb_surrogate_trace",
+        action="store_true",
+        help=(
+            "TorchInfo + TB add_graph tiny surrogate at train start. Off by default (can hang on Windows+CUDA)."
+        ),
+    )
+    parser.add_argument(
+        "--tb_full_graph",
+        action="store_true",
+        help=(
+            "Log extra TensorBoard GRAPHs: BrepEncoder+head from one small source-domain graph, "
+            "plus domain discriminator / GRL+d stack when applicable."
+        ),
+    )
+    parser.add_argument(
+        "--tb_profile",
+        action="store_true",
+        help="Emit PyTorch profiler traces under the run logs dir for TensorBoard PROFILE.",
+    )
+    parser.add_argument("--tb_profile_wait", type=int, default=1, help="Profiler schedule: wait steps.")
+    parser.add_argument("--tb_profile_warmup", type=int, default=1, help="Profiler schedule: warmup steps.")
+    parser.add_argument("--tb_profile_active", type=int, default=3, help="Profiler schedule: active steps per repeat.")
+    parser.add_argument("--tb_profile_repeat", type=int, default=1, help="Profiler schedule: repeat count.")
+    parser.add_argument(
+        "--tb_profile_cuda_only",
+        action="store_true",
+        help="Profiler: CUDA activities only (lower overhead; less CPU detail). Requires GPU.",
+    )
 
     args = parser.parse_args()
+
+    if args.cuda_launch_blocking:
+        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    else:
+        os.environ.pop("CUDA_LAUNCH_BLOCKING", None)
 
     repo_root = pathlib.Path(__file__).parent
 
@@ -158,6 +295,10 @@ def main():
 
         results_path = repo_root.joinpath("results", "stage2", args.run_name)
         results_path.mkdir(parents=True, exist_ok=True)
+        logs_path = repo_root.joinpath(
+            "results", "logs", "stage2", args.run_name
+        )
+        logs_path.mkdir(parents=True, exist_ok=True)
 
         # ModelCheckpoint: monitor="eval_loss" with mode="min" because
         # eval_loss = 1 / target_accuracy → lowest eval_loss = highest accuracy.
@@ -170,31 +311,75 @@ def main():
             save_last=True,
         )
 
-        trainer = Trainer(
+        callbacks = build_train_callbacks(
+            checkpoint=checkpoint_callback,
+            stage="stage2",
+            dim_node=args.dim_node,
+            hyperparam_extras={
+                "source_path": args.source_path,
+                "target_path": args.target_path,
+                "pt_subdir": args.pt_subdir,
+                "iwdan": args.iwdan,
+                "iwdan_source_priors": args.iwdan_source_priors,
+                "iwdan_target_priors": args.iwdan_target_priors,
+                "pre_train": args.pre_train,
+                "checkpoint_dir": str(results_path),
+                "logs_dir": str(logs_path),
+                "multi_hop_max_dist": 16,
+                "spatial_pos_max": 32,
+                "pin_memory": bool(args.pin_memory),
+                "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
+            },
+            repo_root=repo_root,
+            tb_full_graph=args.tb_full_graph,
+            tb_surrogate_trace=args.tb_surrogate_trace or None,
+        )
+        loggers = build_loggers(
+            logs_save_dir=logs_path,
+            experiment_name=args.run_name,
+            csv_log=args.csv_log,
+            use_wandb=args.use_wandb,
+            wandb_project=args.wandb_project,
+        )
+
+        profiler = build_pytorch_profiler(
+            logs_path,
+            enabled=args.tb_profile,
+            wait=args.tb_profile_wait,
+            warmup=args.tb_profile_warmup,
+            active=args.tb_profile_active,
+            repeat=args.tb_profile_repeat,
+            cuda_only=args.tb_profile_cuda_only,
+        )
+
+        tk = dict(
             max_epochs=args.max_epochs,
             log_every_n_steps=args.log_every_n_steps,
-            callbacks=[checkpoint_callback],
-            logger=TensorBoardLogger(
-                save_dir=str(results_path),
-                name="tensorboard",
-            ),
+            callbacks=callbacks,
+            logger=loggers,
             accelerator="gpu",
             devices=1,
             gradient_clip_val=1.0,
         )
+        if profiler is not None:
+            tk["profiler"] = profiler
+        if args.limit_train_batches is not None:
+            tk["limit_train_batches"] = args.limit_train_batches
+        if args.limit_val_batches is not None:
+            tk["limit_val_batches"] = args.limit_val_batches
+        trainer = Trainer(**tk)
         print(
             f"""
 -----------------------------------------------------------------------------------
 Transfer learning / domain adaptation (Stage 2)
 -----------------------------------------------------------------------------------
 Run folder:
-  results/stage2/{args.run_name}/
+  results/stage2/{args.run_name}/     (checkpoints only)
 
-TensorBoard logs:
-  results/stage2/{args.run_name}/tensorboard/
-
-To monitor training:
-  tensorboard --logdir results/stage2/{args.run_name}/tensorboard
+TensorBoard (+ optional CSV / W&B) logs:
+  results/logs/stage2/{args.run_name}/tensorboard/
+  tensorboard --logdir results/logs/stage2/{args.run_name}/
+  (use run folder root to include PROFILE traces when --tb_profile is set)
 
 Best checkpoint:
   results/stage2/{args.run_name}/best.ckpt
@@ -209,6 +394,7 @@ Best checkpoint:
             random_rotate=True,
             num_class=args.num_classes,
             open_set=args.open_set,
+            pt_subdir=args.pt_subdir,
         )
         val_data = Dataset(
             root_dir_source=args.source_path,
@@ -217,12 +403,21 @@ Best checkpoint:
             random_rotate=False,
             num_class=args.num_classes,
             open_set=args.open_set,
+            pt_subdir=args.pt_subdir,
         )
         train_loader = train_data.get_dataloader(
-            batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            prefetch_factor=args.dataloader_prefetch_factor,
         )
         val_loader = val_data.get_dataloader(
-            batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            prefetch_factor=args.dataloader_prefetch_factor,
         )
         trainer.fit(model, train_loader, val_loader)
 
@@ -240,9 +435,14 @@ Best checkpoint:
             split="test",
             num_class=args.num_classes,
             open_set=args.open_set,
+            pt_subdir=args.pt_subdir,
         )
         test_loader = test_data.get_dataloader(
-            batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            prefetch_factor=args.dataloader_prefetch_factor,
         )
         model = DomainAdapt.load_from_checkpoint(args.checkpoint)
         trainer.test(model, dataloaders=test_loader, ckpt_path=args.checkpoint)

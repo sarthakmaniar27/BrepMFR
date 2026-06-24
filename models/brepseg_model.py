@@ -148,6 +148,7 @@ class BrepSeg(pl.LightningModule):
             # apply layernorm before self-attention and ffn. Without this, post layernorm will used
             apply_params_init=True,  # use custom param initialization for Graphormer
             activation_fn="gelu",  # activation function to use
+            max_nodes_for_a3=getattr(args, "max_nodes_for_a3", None),
         )
 
         self.attention = Attention(args.dim_node)
@@ -290,29 +291,40 @@ class BrepSeg(pl.LightningModule):
         torch.cuda.empty_cache()
 
         # brep encoder----------------------------------------------------------------------------------
-        node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)
+        with torch.profiler.record_function("brep_encoder"):
+            node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)
 
         # node classifier--------------------------------------------------------------------------------
-        node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
-        node_emb = node_emb[:, 1:, :]            # node_emb [batch_size, max_node_num, dim] without global node
-        padding_mask = batch["padding_mask"]     # [batch_size, max_node_num]
-        node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
-        node_z = node_emb[node_pos]  # [total_nodes, dim_z]
-        padding_mask_ = ~padding_mask
-        num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
-        graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
-        z = self.attention([node_z, graph_z])
-        node_seg = self.classifier(z) # [total_nodes, num_classes]
+        with torch.profiler.record_function("pool_attn_classifier"):
+            node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
+            node_emb = node_emb[:, 1:, :]            # node_emb [batch_size, max_node_num, dim] without global node
+            padding_mask = batch["padding_mask"]     # [batch_size, max_node_num]
+            node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
+            node_z = node_emb[node_pos]  # [total_nodes, dim_z]
+            padding_mask_ = ~padding_mask
+            num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
+            graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
+            z = self.attention([node_z, graph_z])
+            node_seg = self.classifier(z) # [total_nodes, num_classes]
 
         # loss-------------------------------------------------------------------------------------------
-        labels = batch["label_feature"].long()
-        labels_onehot = F.one_hot(labels, self.num_classes)
-        # Apply class weights only when --class_weights_path was provided.
-        # When unused, self.class_weights is all-1.0 and the result is identical
-        # to unweighted CE, but we still pass None to skip a few ops.
-        cw = self.class_weights if self.use_class_weights else None
-        loss = CrossEntropyLoss(labels_onehot, node_seg, class_level_weight=cw)
-        self.log("train_loss", loss, on_step=False, on_epoch=True)
+        with torch.profiler.record_function("loss"):
+            labels = batch["label_feature"].long()
+            labels_onehot = F.one_hot(labels, self.num_classes)
+            # Apply class weights only when --class_weights_path was provided.
+            # When unused, self.class_weights is all-1.0 and the result is identical
+            # to unweighted CE, but we still pass None to skip a few ops.
+            cw = self.class_weights if self.use_class_weights else None
+            loss = CrossEntropyLoss(labels_onehot, node_seg, class_level_weight=cw)
+        bs = int(labels.shape[0])
+        self.log(
+            "train_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=bs,
+        )
         return loss
 
     def on_train_epoch_end(self):
@@ -329,29 +341,53 @@ class BrepSeg(pl.LightningModule):
         self.classifier.eval()
         torch.cuda.empty_cache()
 
-        node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)  # logits [total_nodes, num_classes]
+        with torch.profiler.record_function("brep_encoder"):
+            node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)  # logits [total_nodes, num_classes]
 
-        node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
-        node_emb = node_emb[:, 1:, :]            # node_emb [batch_size, max_node_num, dim] without global node
-        padding_mask = batch["padding_mask"]     # [batch_size, max_node_num]
-        node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
-        node_z = node_emb[node_pos]  # [total_nodes, dim]
-        padding_mask_ = ~padding_mask
-        num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
-        graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
-        z = self.attention([node_z, graph_z])
-        node_seg = self.classifier(z)  # [total_nodes, num_classes]
+        with torch.profiler.record_function("pool_attn_classifier"):
+            node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
+            node_emb = node_emb[:, 1:, :]            # node_emb [batch_size, max_node_num, dim] without global node
+            padding_mask = batch["padding_mask"]     # [batch_size, max_node_num]
+            node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
+            node_z = node_emb[node_pos]  # [total_nodes, dim]
+            padding_mask_ = ~padding_mask
+            num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
+            graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
+            z = self.attention([node_z, graph_z])
+            node_seg = self.classifier(z)  # [total_nodes, num_classes]
 
-        labels = batch["label_feature"].long()  # labels [total_nodes]
-        labels_np = labels.long().detach().cpu().numpy()
-        labels_onehot = F.one_hot(labels, self.num_classes)
-        loss = CrossEntropyLoss(labels_onehot, node_seg)
-        self.log("eval_loss", loss, on_step=False, on_epoch=True)
+        with torch.profiler.record_function("loss"):
+            labels = batch["label_feature"].long()  # labels [total_nodes]
+            labels_np = labels.long().detach().cpu().numpy()
+            labels_onehot = F.one_hot(labels, self.num_classes)
+            loss = CrossEntropyLoss(labels_onehot, node_seg)
+            self.log(
+                "eval_loss",
+                loss,
+                on_step=False,
+                on_epoch=True,
+                batch_size=int(labels.shape[0]),
+            )
 
         preds = torch.argmax(node_seg, dim=-1)  # pres [total_nodes]
         preds_np = preds.long().detach().cpu().numpy()
         for i in range(len(preds_np)): self.pred.append(preds_np[i])
         for i in range(len(labels_np)): self.label.append(labels_np[i])
+
+        if (
+            batch_idx == 0
+            and self.trainer.current_epoch % 5 == 0
+            and self.trainer.is_global_zero
+        ):
+            from models.tensorboard_media import tb_add_histogram
+
+            mx = node_seg.max(dim=-1).values.detach().cpu()
+            tb_add_histogram(
+                self.trainer,
+                "val/max_pred_prob_batch0",
+                mx,
+                int(self.trainer.global_step),
+            )
 
         return loss
 
@@ -362,6 +398,18 @@ class BrepSeg(pl.LightningModule):
         self.label = []
         per_face_comp = (preds_np == labels_np).astype(np.int64)
         self.log("per_face_accuracy", np.mean(per_face_comp))
+
+        if self.trainer.is_global_zero:
+            from models.tensorboard_media import log_segmentation_val_media
+
+            log_segmentation_val_media(
+                self.trainer,
+                preds_np,
+                labels_np,
+                self.num_classes,
+                int(self.current_epoch),
+                prefix="val",
+            )
 
     def test_step(self, batch, batch_idx):
         self.brep_encoder.eval()

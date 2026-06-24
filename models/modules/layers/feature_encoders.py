@@ -145,6 +145,9 @@ class CurveEncoder(nn.Module):
     def forward(self, x):
         assert x.size(1) == self.in_channels
         batch_size = x.size(0)
+        if batch_size == 0:
+            out_dim = int(self.fc[0].out_features)
+            return x.new_zeros((0, out_dim), dtype=x.dtype, device=x.device)
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)
@@ -191,6 +194,9 @@ class SurfaceEncoder(nn.Module):
     def forward(self, x):
         assert x.size(1) == self.in_channels
         batch_size = x.size(0)
+        if batch_size == 0:
+            out_dim = int(self.fc[0].out_features)
+            return x.new_zeros((0, out_dim), dtype=x.dtype, device=x.device)
         x = self.conv1(x)
         x = self.conv2(x)
         x = self.conv3(x)

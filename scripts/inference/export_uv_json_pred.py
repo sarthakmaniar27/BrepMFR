@@ -18,6 +18,13 @@ Usage::
   python scripts/inference/export_uv_json_pred.py --dataset_root Y:\\new_dataset\\test
 
   python scripts/inference/export_uv_json_pred.py --checkpoint results/.../best.ckpt
+
+**Single PyG folder** (after ``run_pyg_inference`` wrote CSVs)::
+
+  python scripts/inference/export_uv_json_pred.py ^
+    --pyg_dir Y:\\new_dataset\\test\\abc\\abc_brepmfr_test_inference\\pyg_lite ^
+    --inference_dir Y:\\new_dataset\\test\\abc\\abc_brepmfr_test_inference\\inference_lite ^
+    --uv_json_dir Y:\\new_dataset\\test\\abc\\abc_brepmfr_test_inference\\uv_json_pred_lite
 """
 
 from __future__ import annotations
@@ -114,7 +121,11 @@ def _namespace_from_ckpt(ckpt: Dict[str, Any]) -> Namespace:
     return Namespace(**{k: v for k, v in h.items() if k != "args"})
 
 
-def load_brepseg_for_inference(ckpt_path: pathlib.Path, device: torch.device) -> Tuple[BrepSeg, int]:
+def load_brepseg_for_inference(
+    ckpt_path: pathlib.Path,
+    device: torch.device,
+    max_nodes_for_a3: Optional[int] = 768,
+) -> Tuple[BrepSeg, int]:
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     if "state_dict" not in ckpt:
         raise ValueError("Not a Lightning checkpoint (no state_dict)")
@@ -125,6 +136,11 @@ def load_brepseg_for_inference(ckpt_path: pathlib.Path, device: torch.device) ->
     cw = getattr(args, "class_weights_path", None)
     if cw and not pathlib.Path(cw).is_file():
         args.class_weights_path = None
+
+    if max_nodes_for_a3 is not None and max_nodes_for_a3 <= 0:
+        args.max_nodes_for_a3 = None
+    else:
+        args.max_nodes_for_a3 = max_nodes_for_a3
 
     num_classes = int(getattr(args, "num_classes", 25))
     model = BrepSeg(args)
@@ -303,9 +319,94 @@ def main() -> None:
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--multi_hop_max_dist", type=int, default=16)
     ap.add_argument("--spatial_pos_max", type=int, default=32)
+    ap.add_argument(
+        "--max_nodes_for_a3",
+        type=int,
+        default=768,
+        help="Same as run_pyg_inference: cap A3 for huge graphs (0 = no cap).",
+    )
     ap.add_argument("--max_files", type=int, default=None)
     ap.add_argument("--skip_existing", action="store_true")
+    ap.add_argument(
+        "--pyg_dir",
+        type=pathlib.Path,
+        default=None,
+        help="Process one folder of *.pt (overrides --dataset_root / --only). Pair with --inference_dir.",
+    )
+    ap.add_argument(
+        "--inference_dir",
+        type=pathlib.Path,
+        default=None,
+        help="CSV dir when using --pyg_dir (default: <parent of pyg_dir>/inference).",
+    )
+    ap.add_argument(
+        "--uv_json_dir",
+        type=pathlib.Path,
+        default=None,
+        help="Output JSON dir when using --pyg_dir (default: <parent of pyg_dir>/uv_json_pred).",
+    )
     args = ap.parse_args()
+
+    if args.pyg_dir is not None:
+        pyg_dir = args.pyg_dir.expanduser().resolve()
+        if not pyg_dir.is_dir():
+            raise SystemExit(f"--pyg_dir is not a directory: {pyg_dir}")
+        inf_dir = (
+            args.inference_dir.expanduser().resolve()
+            if args.inference_dir is not None
+            else (pyg_dir.parent / "inference")
+        )
+        uv_dir = (
+            args.uv_json_dir.expanduser().resolve()
+            if args.uv_json_dir is not None
+            else (pyg_dir.parent / "uv_json_pred")
+        )
+
+        device = torch.device(args.device)
+        if args.device.startswith("cuda") and not torch.cuda.is_available():
+            print("CUDA unavailable; using CPU.", flush=True)
+            device = torch.device("cpu")
+
+        model: Optional[BrepSeg] = None
+        num_classes = 25
+        if args.checkpoint is not None:
+            ck = args.checkpoint.resolve()
+            print(f"Loading checkpoint (CSV fallback): {ck}", flush=True)
+            model, num_classes = load_brepseg_for_inference(ck, device, int(args.max_nodes_for_a3))
+
+        files = sorted(pyg_dir.glob("*.pt"))
+        if args.max_files is not None:
+            files = files[: args.max_files]
+
+        grand_ok = grand_fail = 0
+        for pt_path in tqdm(files, desc="uv_json_pred(single_dir)"):
+            stem = pt_path.stem
+            csv_path = inf_dir / f"{stem}.csv"
+            json_path = uv_dir / f"{stem}.json"
+            try:
+                pyg = torch_load_pt(pt_path)
+            except Exception as e:
+                print(f"[skip] load failed {pt_path}: {e}")
+                grand_fail += 1
+                continue
+            ok = process_one_graph(
+                pt_path,
+                csv_path,
+                json_path,
+                pyg,
+                model,
+                num_classes,
+                device,
+                args.multi_hop_max_dist,
+                args.spatial_pos_max,
+                args.skip_existing,
+            )
+            if ok:
+                grand_ok += 1
+            else:
+                grand_fail += 1
+        print(f"single_dir: ok={grand_ok} fail={grand_fail} -> {uv_dir}", flush=True)
+        return
 
     sets = {"cadsynth", "mfcadpp", "abc"}
     if args.only:
@@ -327,7 +428,7 @@ def main() -> None:
     if args.checkpoint is not None:
         ck = args.checkpoint.resolve()
         print(f"Loading checkpoint (CSV fallback): {ck}", flush=True)
-        model, num_classes = load_brepseg_for_inference(ck, device)
+        model, num_classes = load_brepseg_for_inference(ck, device, int(args.max_nodes_for_a3))
 
     grand_ok = grand_fail = 0
 

@@ -161,6 +161,7 @@ def run_stage1_on_filelist(
     num_workers: int,
     max_batches: int,
     title: str,
+    pt_subdir: str | None = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -170,7 +171,7 @@ def run_stage1_on_filelist(
     )
 
     model = load_stage1_model(checkpoint, device)
-    ds = FilelistDataset(dataset_root, filelist)
+    ds = FilelistDataset(dataset_root, filelist, pt_subdir)
     loader = make_loader(ds, batch_size, num_workers)
     if max_batches > 0:
 
@@ -198,6 +199,8 @@ def run_stage1_on_filelist(
         f.write(f"- Checkpoint: `{checkpoint}`\n")
         f.write(f"- Dataset root: `{dataset_root}`\n")
         f.write(f"- Filelist: `{filelist}`\n")
+        if pt_subdir:
+            f.write(f"- `--pt_subdir`: `{pt_subdir}`\n")
         f.write(f"- Faces evaluated: **{len(labels):,}**\n\n")
         f.write("## Global metrics\n\n")
         f.write("| Metric | Value |\n")
@@ -233,6 +236,7 @@ def run_stage2_mfcad_test(
     num_workers: int,
     max_batches: int,
     title: str,
+    pt_subdir: str | None = None,
 ):
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,6 +254,7 @@ def run_stage2_mfcad_test(
         random_rotate=False,
         num_class=num_classes,
         open_set=0,
+        pt_subdir=pt_subdir,
     )
     dl_kw = _dataloader_kw(num_workers)
     dl_kw["drop_last"] = False
@@ -285,6 +290,8 @@ def run_stage2_mfcad_test(
     with open(out_dir / "summary.md", "w", encoding="utf-8") as f:
         f.write(f"# {title}\n\n")
         f.write(f"- Checkpoint: `{checkpoint}`\n")
+        if pt_subdir:
+            f.write(f"- `--pt_subdir`: `{pt_subdir}` (source + target graph scan roots)\n")
         f.write("- Split: **test** (`t_test.txt` on target; paired `s_test.txt` on source)\n")
         f.write(f"- Faces evaluated: **{len(labels):,}**\n\n")
         f.write("## Global metrics (target only)\n\n")
@@ -331,6 +338,14 @@ def main():
         default="results/diagnostics/paper_table3_cadsynth_to_mfcadpp",
         help="Output directory root",
     )
+    p.add_argument(
+        "--pt_subdir",
+        default=None,
+        help=(
+            "Relative subgraph dir under source/target roots (e.g. output/bin_skip_a2); "
+            "passed to Stage 1 filelist scan and Stage 2 TransferDataset."
+        ),
+    )
     args = p.parse_args()
 
     out_root = pathlib.Path(args.out_root)
@@ -347,6 +362,7 @@ def main():
                 args.num_workers,
                 args.max_batches,
                 "Table 3 style — Stage 1 on CADSynth test (s_test.txt)",
+                args.pt_subdir,
             )
         elif name == "stage1_mfcadpp_test":
             run_stage1_on_filelist(
@@ -359,6 +375,7 @@ def main():
                 args.num_workers,
                 args.max_batches,
                 "Table 3 style — Stage 1 on MFCAD++ test (source-only / no DA)",
+                args.pt_subdir,
             )
         elif name == "stage2_mfcadpp_test":
             if not args.stage2_ckpt:
@@ -374,6 +391,7 @@ def main():
                 args.num_workers,
                 args.max_batches,
                 "Table 3 style — Stage 2 DA on MFCAD++ test",
+                args.pt_subdir,
             )
 
     if args.run_all:

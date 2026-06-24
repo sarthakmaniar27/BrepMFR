@@ -1,5 +1,7 @@
 from typing import Callable, Optional
 import math
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -207,16 +209,14 @@ class GraphNodeFeature(nn.Module):
         x_ = self.surf_encoder(x)  # [total_nodes, n_hidden]
         face_area_ = self.face_area_encoder(face_area.unsqueeze(dim=1))  # [total_nodes, n_hidden]
 
-        # ---------------- DEBUG: face_type range check ----------------
-        # if True:  # or use a debug flag
-        #     ft_min = int(face_type.min())
-        #     ft_max = int(face_type.max())
-        #     print(f"[DBG] face_type min/max: {ft_min} {ft_max} num_embeddings: {self.face_type_encoder.num_embeddings}")
-        # -------------------------------------------------------------
+        # Embeddings have fixed vocab sizes; macro / CAD data can exceed training ranges (CUDA assert).
+        ft_idx = face_type.long().clamp(0, self.face_type_encoder.num_embeddings - 1)
+        fl_idx = face_loop.long().clamp(0, self.face_loop_encoder.num_embeddings - 1)
+        fd_idx = face_degree.long().clamp(0, self.degree_encoder.num_embeddings - 1)
 
-        face_type_ = self.face_type_encoder(face_type)  # [total_nodes, n_hidden]
-        face_loop_ = self.face_loop_encoder(face_loop)
-        face_degree_ = self.degree_encoder(face_degree)
+        face_type_ = self.face_type_encoder(ft_idx)
+        face_loop_ = self.face_loop_encoder(fl_idx)
+        face_degree_ = self.degree_encoder(fd_idx)
 
         node_feature = torch.cat((x_, face_area_, face_type_, face_loop_, face_degree_), dim=-1)
 
@@ -330,10 +330,13 @@ class GraphAttnBias(nn.Module):
             edge_type,
             multi_hop_max_dist,
             n_layers,
+            max_nodes_for_a3: Optional[int] = None,
     ):
         super(GraphAttnBias, self).__init__()
         self.num_heads = num_heads
         self.multi_hop_max_dist = multi_hop_max_dist
+        # A3 gathers O(n^2 * max_dist) edge indices; None = no cap (training / large GPUs).
+        self.max_nodes_for_a3 = max_nodes_for_a3
 
         # spatial_feature encode
         self.spatial_pos_encoder = nn.Embedding(num_spatial, num_heads, padding_idx=0)
@@ -364,14 +367,34 @@ class GraphAttnBias(nn.Module):
         self.apply(lambda module: init_params(module, n_layers=n_layers))
 
     def forward(self, attn_bias, spatial_pos, d2_distance, ang_distance, edge_data, edge_type, edge_len, edge_ang, edge_conv, edge_path, edge_padding_mask, edge_index, node_feat):
-        n_graph, n_node = edge_path.size()[:2]
+        n_graph = attn_bias.size(0)
+        n_node = attn_bias.size(1) - 1
 
         graph_attn_bias = attn_bias.clone()
         graph_attn_bias = graph_attn_bias.unsqueeze(1).repeat(1, self.num_heads, 1, 1)
         # [n_graph, n_head, n_node+1, n_node+1] 描述每一头注意力下各节点之间的关系矩阵
 
-
-
+        use_a1 = spatial_pos is not None
+        use_a2 = d2_distance is not None and ang_distance is not None
+        use_a3 = self.edge_type == "multi_hop" and edge_path is not None and use_a1
+        run_a3 = use_a3
+        if (
+            run_a3
+            and self.max_nodes_for_a3 is not None
+            and n_node > self.max_nodes_for_a3
+        ):
+            if not getattr(self, "_warned_skip_a3_nodes", False):
+                warnings.warn(
+                    f"GraphAttnBias: skipping multi-hop edge bias (A3) because n_node={n_node} "
+                    f"exceeds max_nodes_for_a3={self.max_nodes_for_a3} "
+                    f"(dense gather would be ~O(n^2×{self.multi_hop_max_dist}) elements). "
+                    f"Spatial bias (A1) still applies. Use --max_nodes_for_a3 0 to disable this cap, "
+                    f"or regenerate graphs with inference_profile=lite (no edge_path).",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self._warned_skip_a3_nodes = True
+            run_a3 = False
 
         # ---- DEBUG: spatial_pos sanity ----
         # if not hasattr(self, "_dbg_done"):
@@ -410,58 +433,36 @@ class GraphAttnBias(nn.Module):
         #     self._dbg_done += 1
         # ---- DEBUG END ----
 
-        # spatial_pos must be in [0, num_embeddings-1]
-        
-        # new code starts here: we clamp spatial_pos to the valid range [0, num_spatial-1] and treat out-of-range values as padding (which will be ignored in the attention bias)
-        num_spatial = self.spatial_pos_encoder.num_embeddings
+        if use_a1:
+            # spatial_pos must be in [0, num_embeddings-1]
+            num_spatial = self.spatial_pos_encoder.num_embeddings
+            spatial_pos = spatial_pos.clone()
+            spatial_pos[spatial_pos < 0] = 0
+            spatial_pos = spatial_pos.clamp(0, num_spatial - 1)
 
-        # optional but recommended: treat "unreachable" as 0 padding
-        spatial_pos = spatial_pos.clone()
-        spatial_pos[spatial_pos < 0] = 0
+            spatial_pos_bias = self.spatial_pos_encoder(spatial_pos)
+            spatial_pos_bias = spatial_pos_bias.permute(0, 3, 1, 2)
+            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + spatial_pos_bias
 
-        spatial_pos = spatial_pos.clamp(0, num_spatial - 1)
-        
-        # new code ends here
+            t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
+            graph_attn_bias[:, :, 1:, 0] = graph_attn_bias[:, :, 1:, 0] + t
+            graph_attn_bias[:, :, 0, :] = graph_attn_bias[:, :, 0, :] + t
 
-        # debug: print spatial_pos stats and check for out-of-range values before encoding
+        if use_a2:
+            d2_distance = d2_distance.reshape(-1, 64)
+            d2_pos_bias = self.d2_pos_encoder(d2_distance)
+            d2_pos_bias = d2_pos_bias.reshape(n_graph, n_node, n_node, self.num_heads)
+            d2_pos_bias = d2_pos_bias.permute(0, 3, 1, 2)
+            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + d2_pos_bias
 
-        # spatial_pos = spatial_pos.to(torch.long)
-        # ns = self.spatial_pos_encoder.num_embeddings
-        # sp_min, sp_max = int(spatial_pos.min()), int(spatial_pos.max())
-        # print("[DBG] spatial_pos min/max:", sp_min, sp_max, "num_embeddings:", ns)
-        # assert 0 <= sp_min and sp_max < ns
-
-
-
-        # spatial_pos 空间编码------------------------------------------------------------------------------------------------------------
-        spatial_pos_bias = self.spatial_pos_encoder(spatial_pos)  # spatial_pos_bias[n_graph, n_node, n_node, n_head]
-        spatial_pos_bias = spatial_pos_bias.permute(0, 3, 1, 2)  # spatial_pos_bias[n_graph, n_head, n_node, n_node]
-        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + spatial_pos_bias
-
-        # reset spatial pos here 设置全局虚拟节点到其他节点的距离
-        t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
-        graph_attn_bias[:, :, 1:, 0] = graph_attn_bias[:, :, 1:, 0] + t
-        graph_attn_bias[:, :, 0, :] = graph_attn_bias[:, :, 0, :] + t
-        # spatial_pos 空间编码------------------------------------------------------------------------------------------------------------
-
-        # 欧氏空间编码---------------------------------------------------------------------------------------------------------------------
-        # 在空间编码中增加面-面之间的D2距离
-        d2_distance = d2_distance.reshape(-1, 64)
-        d2_pos_bias = self.d2_pos_encoder(d2_distance)  # [n_graph, n_node, n_node, 64] -> [n_graph, n_node, n_node, n_head]
-        d2_pos_bias = d2_pos_bias.reshape(n_graph, n_node, n_node, self.num_heads)
-        d2_pos_bias = d2_pos_bias.permute(0, 3, 1, 2)
-        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + d2_pos_bias
-
-        # 在空间编码中增加面-面之间的角度编码
-        ang_distance = ang_distance.reshape(-1, 64)
-        ang_pos_bias = self.ang_pos_encoder(ang_distance)  # [n_graph, n_node, n_node, 64] -> [n_graph, n_node, n_node, n_head]
-        ang_pos_bias = ang_pos_bias.reshape(n_graph, n_node, n_node, self.num_heads)
-        ang_pos_bias = ang_pos_bias.permute(0, 3, 1, 2)
-        graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + ang_pos_bias
-        # 欧氏空间编码---------------------------------------------------------------------------------------------------------------------
+            ang_distance = ang_distance.reshape(-1, 64)
+            ang_pos_bias = self.ang_pos_encoder(ang_distance)
+            ang_pos_bias = ang_pos_bias.reshape(n_graph, n_node, n_node, self.num_heads)
+            ang_pos_bias = ang_pos_bias.permute(0, 3, 1, 2)
+            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + ang_pos_bias
 
         # edge_feature 边编码------------------------------------------------------------------------------------------------------------
-        if self.edge_type == "multi_hop":
+        if run_a3:
             spatial_pos_ = spatial_pos.clone()  # Record the distance between any two nodes [batch_size, max_node_num, max_node_num]. The distance from a node to itself is recorded as 1.
             spatial_pos_[spatial_pos_ == 0] = 1  # Set the padding to 1. Empty spaces (which can be considered virtual nodes) are uniformly set to 1, and the distance from a node to itself is also recorded as 1.
             # set 1 to 1, x > 1 to x - 1
@@ -527,7 +528,9 @@ class GraphAttnBias(nn.Module):
 
 
 
-            edge_type_ = self.edge_type_encoder(edge_type)
+            edge_type_ = self.edge_type_encoder(
+                edge_type.long().clamp(0, self.edge_type_encoder.num_embeddings - 1)
+            )
             edge_len_ = self.edge_len_encoder(edge_len.unsqueeze(dim=1))
             edge_ang_ = self.edge_ang_encoder(edge_ang.unsqueeze(dim=1))
 
@@ -541,7 +544,9 @@ class GraphAttnBias(nn.Module):
             # assert 0 <= ec_min and ec_max < ec_vocab
 
 
-            edge_conv_ = self.edge_conv_encoder(edge_conv)
+            edge_conv_ = self.edge_conv_encoder(
+                edge_conv.long().clamp(0, self.edge_conv_encoder.num_embeddings - 1)
+            )
             edge_feat = edge_data_ + edge_type_ + edge_len_ + edge_ang_ + edge_conv_
 
             # add node_feature to edge_feature
