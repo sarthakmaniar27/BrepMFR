@@ -1,0 +1,239 @@
+<Window x:Class="SwOrchestrator.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:SwOrchestrator"
+        Title="SOLIDWORKS Thread Orchestrator"
+        Height="780" Width="1050"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI" FontSize="12">
+
+    <Window.Resources>
+        <Style TargetType="GroupBox">
+            <Setter Property="Margin" Value="0,0,0,8" />
+            <Setter Property="Padding" Value="8" />
+        </Style>
+        <Style TargetType="Label">
+            <Setter Property="Padding" Value="0,4,8,4" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+        <Style TargetType="TextBox" x:Key="PathBox">
+            <Setter Property="Margin" Value="0,2,4,2" />
+            <Setter Property="Padding" Value="4,3" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+        </Style>
+        <Style TargetType="TextBox" x:Key="NumBox">
+            <Setter Property="Margin" Value="0,2,8,2" />
+            <Setter Property="Padding" Value="4,3" />
+            <Setter Property="Width" Value="80" />
+            <Setter Property="HorizontalContentAlignment" Value="Right" />
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="12,4" />
+            <Setter Property="MinWidth" Value="80" />
+            <Setter Property="Margin" Value="0,0,8,0" />
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />   <!-- Config -->
+            <RowDefinition Height="Auto" />   <!-- Progress strip -->
+            <RowDefinition Height="*"    />   <!-- Log + skip list -->
+            <RowDefinition Height="Auto" />   <!-- Buttons -->
+        </Grid.RowDefinitions>
+
+        <!-- Configuration ============================================ -->
+        <GroupBox Grid.Row="0" Header="Configuration"
+                  IsEnabled="{Binding IsConfigEditable}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="130" />
+                    <ColumnDefinition Width="*"   />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="6" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="6" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <Label   Grid.Row="0" Grid.Column="0" Content="SOLIDWORKS exe:" />
+                <TextBox Grid.Row="0" Grid.Column="1" Style="{StaticResource PathBox}"
+                         Text="{Binding Settings.SolidWorksExe, UpdateSourceTrigger=PropertyChanged}" />
+                <Button  Grid.Row="0" Grid.Column="2" Content="Browse…" Click="BrowseSolidWorksExe_Click" />
+
+                <Label   Grid.Row="1" Grid.Column="0" Content="Macro path:" />
+                <TextBox Grid.Row="1" Grid.Column="1" Style="{StaticResource PathBox}"
+                         Text="{Binding Settings.MacroPath, UpdateSourceTrigger=PropertyChanged}" />
+                <Button  Grid.Row="1" Grid.Column="2" Content="Browse…" Click="BrowseMacroPath_Click" />
+
+                <Label   Grid.Row="2" Grid.Column="0" Content="STEPS folder:" />
+                <TextBox Grid.Row="2" Grid.Column="1" Style="{StaticResource PathBox}"
+                         Text="{Binding Settings.StepsFolder, UpdateSourceTrigger=PropertyChanged}"
+                         LostFocus="StepsFolder_LostFocus" />
+                <Button  Grid.Row="2" Grid.Column="2" Content="Browse…" Click="BrowseStepsFolder_Click" />
+
+                <Label   Grid.Row="3" Grid.Column="0" Content="Status folder:" />
+                <TextBox Grid.Row="3" Grid.Column="1" Style="{StaticResource PathBox}"
+                         Text="{Binding Settings.StatusFolder, UpdateSourceTrigger=PropertyChanged}" />
+                <Button  Grid.Row="3" Grid.Column="2" Content="Browse…" Click="BrowseStatusFolder_Click" />
+
+                <!-- Numeric tunables -->
+                <StackPanel Grid.Row="5" Grid.ColumnSpan="3" Orientation="Horizontal">
+                    <Label Content="Stall timeout (s):" />
+                    <TextBox Style="{StaticResource NumBox}"
+                             Text="{Binding Settings.StallTimeoutSeconds, UpdateSourceTrigger=PropertyChanged}"
+                             ToolTip="Hang detected if no new SLDPRT for this long after the first file finishes." />
+                    <Label Content="Startup grace (s):" />
+                    <TextBox Style="{StaticResource NumBox}"
+                             Text="{Binding Settings.StartupGraceSeconds, UpdateSourceTrigger=PropertyChanged}"
+                             ToolTip="Longer timeout for the very first file (SOLIDWORKS launch + first run)." />
+                    <Label Content="Poll (s):" />
+                    <TextBox Style="{StaticResource NumBox}"
+                             Text="{Binding Settings.PollIntervalSeconds, UpdateSourceTrigger=PropertyChanged}"
+                             ToolTip="How often to check for progress / crashes." />
+                </StackPanel>
+
+                <StackPanel Grid.Row="6" Grid.ColumnSpan="3" Orientation="Horizontal">
+                    <Label Content="Crash threshold:" />
+                    <TextBox Style="{StaticResource NumBox}"
+                             Text="{Binding Settings.SameFileCrashThreshold, UpdateSourceTrigger=PropertyChanged}"
+                             ToolTip="After this many crashes attributed to the same STEP file, blacklist it." />
+                    <Label Content="Cooldown (s):" />
+                    <TextBox Style="{StaticResource NumBox}"
+                             Text="{Binding Settings.CooldownSeconds, UpdateSourceTrigger=PropertyChanged}"
+                             ToolTip="Wait between killing leftover processes and launching the next attempt." />
+                    <Label Content="Max restarts:" />
+                    <TextBox Style="{StaticResource NumBox}"
+                             Text="{Binding Settings.MaxTotalRestarts, UpdateSourceTrigger=PropertyChanged}" />
+                </StackPanel>
+
+                <StackPanel Grid.Row="8" Grid.ColumnSpan="3" Orientation="Horizontal"
+                            HorizontalAlignment="Right">
+                    <Button Content="Save Settings" Click="SaveSettings_Click" />
+                </StackPanel>
+            </Grid>
+        </GroupBox>
+
+        <!-- Progress strip =========================================== -->
+        <Border Grid.Row="1" BorderBrush="LightGray" BorderThickness="1"
+                CornerRadius="3" Padding="10,8" Margin="0,0,0,8">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"    />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <ProgressBar Grid.Row="0" Grid.Column="0"
+                             Height="22"
+                             Maximum="{Binding FilesTotal}"
+                             Value="{Binding FilesDone, Mode=OneWay}"
+                             VerticalAlignment="Center" />
+
+                <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal"
+                            VerticalAlignment="Center" Margin="10,0,0,0">
+                    <Ellipse Width="12" Height="12" Margin="0,0,6,0"
+                             Fill="{Binding RunStateBrush}" />
+                    <TextBlock Text="{Binding RunStateText}" FontWeight="SemiBold"
+                               VerticalAlignment="Center" />
+                </StackPanel>
+
+                <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,4,0,0"
+                           Text="{Binding ProgressText}" />
+
+                <StackPanel Grid.Row="2" Grid.ColumnSpan="2" Orientation="Horizontal" Margin="0,4,0,0">
+                    <TextBlock Text="Macro status: " Foreground="Gray" />
+                    <TextBlock Text="{Binding LastHeartbeatStatus}" FontWeight="SemiBold" Margin="0,0,12,0" />
+                    <TextBlock Text="File: " Foreground="Gray" />
+                    <TextBlock Text="{Binding LastHeartbeatStepFile}" FontFamily="Consolas" Margin="0,0,12,0" />
+                    <TextBlock Text="Last heartbeat: " Foreground="Gray" />
+                    <TextBlock Text="{Binding LastHeartbeatTimeText}" FontFamily="Consolas" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Log + Skip List ========================================== -->
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*" />
+                <ColumnDefinition Width="6" />
+                <ColumnDefinition Width="*"  />
+            </Grid.ColumnDefinitions>
+
+            <GroupBox Grid.Column="0" Header="Activity log">
+                <ListView x:Name="LogList"
+                          ItemsSource="{Binding LogEntries}"
+                          FontFamily="Consolas" FontSize="11"
+                          ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                          ScrollViewer.VerticalScrollBarVisibility="Auto">
+                    <ListView.View>
+                        <GridView>
+                            <GridViewColumn Header="Time"  Width="70">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding TimestampText}" />
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                            <GridViewColumn Header="Level" Width="55">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding LevelText}"
+                                                   Foreground="{Binding Level, Converter={StaticResource LogLevelToBrushConverter}}"
+                                                   FontWeight="SemiBold" />
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                            <GridViewColumn Header="Message" Width="450">
+                                <GridViewColumn.CellTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Message}"
+                                                   TextWrapping="Wrap" />
+                                    </DataTemplate>
+                                </GridViewColumn.CellTemplate>
+                            </GridViewColumn>
+                        </GridView>
+                    </ListView.View>
+                </ListView>
+            </GroupBox>
+
+            <GroupBox Grid.Column="2" Header="Skip list (blacklisted files)">
+                <DockPanel>
+                    <TextBlock DockPanel.Dock="Top"
+                               Text="Files auto-skipped after repeated crashes. Edit skip_files.txt in the status folder to remove entries."
+                               TextWrapping="Wrap"
+                               Foreground="Gray"
+                               Margin="0,0,0,6" />
+                    <ListBox ItemsSource="{Binding SkipListItems}"
+                             FontFamily="Consolas" FontSize="11" />
+                </DockPanel>
+            </GroupBox>
+        </Grid>
+
+        <!-- Buttons ================================================== -->
+        <StackPanel Grid.Row="3" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Margin="0,8,0,0">
+            <Button Content="Open status folder" Click="OpenStatusFolder_Click" />
+            <Button Content="Reset state" Click="ResetState_Click"
+                    IsEnabled="{Binding IsConfigEditable}"
+                    ToolTip="Clears heartbeat and done-marker files. Does NOT delete SLDPRT outputs or the skip list." />
+            <Button Content="Stop" Click="Stop_Click"
+                    IsEnabled="{Binding IsStopEnabled}" />
+            <Button Content="Start" Click="Start_Click"
+                    IsEnabled="{Binding IsStartEnabled}"
+                    FontWeight="Bold"
+                    Background="#E6F4EA" />
+        </StackPanel>
+    </Grid>
+</Window>

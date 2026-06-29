@@ -9,9 +9,9 @@ if (-not (Test-Path (Join-Path $Repo "segmentation.py"))) {
 }
 Set-Location $Repo
 
-$JsonDir = "D:\thread_and_text\root_json"
-$PygDir = "D:\thread_and_text\lite\pyg"
-$LabelDir = "D:\thread_and_text\lite\label"
+$JsonDir = "\\Gr-sw66464\d\thread_and_text\thread_text_merged"
+$PygDir = "E:\thread_text_merged\pyg"
+$LabelDir = "E:\thread_text_merged\label"
 # Split lists (train/val/test.txt) live next to the pyg folder (e.g. .../lite/), not inside pyg/
 $DataRoot = Split-Path $PygDir -Parent
 
@@ -25,10 +25,10 @@ if ($nPyg -lt $nJson) {
     exit 1
 }
 
-conda run -n brep_mfr_pyg python scripts/threads/make_random_splits.py --pyg-dir $PygDir --out-dir $DataRoot --seed 42
+conda run -n brep_mfr python scripts/threads/make_random_splits.py --pyg-dir $PygDir --out-dir $DataRoot --seed 42
 
 New-Item -ItemType Directory -Force -Path "artifacts/class_weights/thread_text" | Out-Null
-conda run -n brep_mfr_pyg python scripts/training/compute_class_weights.py `
+conda run -n brep_mfr python scripts/training/compute_class_weights.py `
     --dataset_path $DataRoot `
     --split train `
     --num_classes 3 `
@@ -36,6 +36,6 @@ conda run -n brep_mfr_pyg python scripts/training/compute_class_weights.py `
     --num_workers 0 `
     --out artifacts/class_weights/thread_text/source_train_alpha05.json
 
-conda run -n brep_mfr_pyg python scripts/threads/count_thread_label_distribution.py --pyg-dir $PygDir --group "0:stock,1:thread,2:text"
+conda run -n brep_mfr python scripts/threads/count_thread_label_distribution.py --pyg-dir $PygDir --group "0:stock,1:thread,2:text"
 
 Write-Host "`nNext: run Stage 1 training (see scripts/threads/README_thread_text.md)."

@@ -1,0 +1,185 @@
+// Sample Jenkinsfile for running SwOrchestrator.Cli across multiple SOLIDWORKS VMs in parallel,
+// with deterministic hash sharding so each VM works on a disjoint slice of one master folder.
+//
+// Prerequisites on each VM (one-time setup):
+//
+//   1. The VM is registered as a Jenkins agent and labelled (e.g. "solidworks-vm1",
+//      "solidworks-vm2", ...) under Manage Jenkins -> Nodes.
+//
+//   2. CRITICAL: the Jenkins agent on each VM must NOT be installed as a Windows
+//      service (services run in Session 0 with no desktop access, which breaks
+//      SOLIDWORKS). Instead:
+//        - Enable auto-login for the dedicated build user.
+//        - Use Task Scheduler with "At log on" trigger to run:
+//            java -jar agent.jar -url http://<jenkins>/ -secret <secret> -name <node>
+//          (Jenkins shows the exact command on each node's status page.)
+//        - The agent now runs in an interactive desktop session where SOLIDWORKS
+//          can launch normally.
+//
+//   3. On each VM:
+//        - Copy SwOrchestrator.Cli.exe to C:\Tools\ (or any path).
+//        - Install the .NET 8 Desktop Runtime.
+//        - Install Python 3 and put it on PATH (used only for stage_shard.py, not
+//          the orchestrator itself). Quick install: `winget install Python.Python.3.12`.
+//
+//   4. The ThreadCreationScript8.swp macro file lives at the path you choose
+//      (default: C:\ThreadRecognition\ThreadCreationScript8.swp).
+//
+//   5. The Jenkins job uses "Pipeline script from SCM" so that stage_shard.py is
+//      checked out into %WORKSPACE% on each agent alongside this Jenkinsfile.
+//      If you'd rather not use SCM checkout, copy stage_shard.py to a known path
+//      on each VM and override STAGE_SHARD_PY below.
+//
+// Trigger the pipeline manually from Jenkins, or via webhook / cron.
+
+pipeline {
+    agent none
+
+    parameters {
+        // -- Source / output paths --
+        string(name: 'SOURCE_STEPS',
+               defaultValue: '\\\\fileserver\\share\\STEPS_master',
+               description: 'Master folder of ALL .step / .stp files (UNC or local). Each VM stages its hash-sharded subset from here into its local STEPS folder.')
+        string(name: 'STEPS_FOLDER',
+               defaultValue: 'C:\\ThreadRecognition\\STEPS',
+               description: 'Local per-VM STEPS folder. The shard staging step populates this before the orchestrator runs.')
+        string(name: 'STATUS_FOLDER',
+               defaultValue: 'C:\\ThreadRecognition',
+               description: 'Folder for heartbeat / done marker / skip list.')
+        string(name: 'MACRO_PATH',
+               defaultValue: 'C:\\ThreadRecognition\\ThreadCreationScript8.swp',
+               description: 'Path to the compiled .swp macro on each agent.')
+
+        // -- Executables --
+        string(name: 'CLI_EXE',
+               defaultValue: 'C:\\Tools\\SwOrchestrator.Cli.exe',
+               description: 'Path to SwOrchestrator.Cli.exe on each agent.')
+        string(name: 'SOLIDWORKS_EXE',
+               defaultValue: 'C:\\Program Files\\SOLIDWORKS Corp\\SOLIDWORKS\\SLDWORKS.exe',
+               description: 'Path to SLDWORKS.exe on each agent.')
+        string(name: 'STAGE_SHARD_PY',
+               defaultValue: '%WORKSPACE%\\stage_shard.py',
+               description: 'Path to stage_shard.py. Default uses workspace (Pipeline-from-SCM puts it there). For inline pipelines, deploy stage_shard.py to a known path (e.g. C:\\Tools\\stage_shard.py) and update this default.')
+
+        // -- Sharding --
+        string(name: 'TOTAL_SHARDS',
+               defaultValue: '3',
+               description: 'Number of VM stages defined below. Hash sharding is deterministic: the same file always lands on the same shard, so do NOT change this mid-batch - every file gets reassigned to a different shard.')
+
+        // -- Orchestrator tunables --
+        string(name: 'STALL_TIMEOUT', defaultValue: '900', description: 'Seconds')
+        string(name: 'STARTUP_GRACE', defaultValue: '300', description: 'Seconds')
+    }
+
+    options {
+        // Batches can run for many hours - allow up to 7 days.
+        timeout(time: 7, unit: 'DAYS')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        stage('Process STEP batches') {
+            // Each branch runs on a different agent. To scale: add another
+            // stage block here, give it the next shard index (3, 4, ...), and
+            // increment TOTAL_SHARDS to match. Each VM should have a unique
+            // agent label.
+            parallel {
+
+                stage('VM1 (shard 0)') {
+                    agent { label 'solidworks-vm1' }
+                    steps {
+                        stageShard(0)
+                        runOrchestrator()
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: '**/heartbeat.txt, **/skip_files.txt',
+                                             allowEmptyArchive: true,
+                                             onlyIfSuccessful: false
+                        }
+                    }
+                }
+
+                stage('VM2 (shard 1)') {
+                    agent { label 'solidworks-vm2' }
+                    steps {
+                        stageShard(1)
+                        runOrchestrator()
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: '**/heartbeat.txt, **/skip_files.txt',
+                                             allowEmptyArchive: true,
+                                             onlyIfSuccessful: false
+                        }
+                    }
+                }
+
+                stage('VM3 (shard 2)') {
+                    agent { label 'solidworks-vm3' }
+                    steps {
+                        stageShard(2)
+                        runOrchestrator()
+                    }
+                    post {
+                        always {
+                            archiveArtifacts artifacts: '**/heartbeat.txt, **/skip_files.txt',
+                                             allowEmptyArchive: true,
+                                             onlyIfSuccessful: false
+                        }
+                    }
+                }
+            }
+        }
+
+        // Optional aggregation stage: copy SLDPRT / JSON outputs from each VM
+        // to a central share. Uncomment and adapt to your environment.
+        //
+        // stage('Aggregate outputs') {
+        //     agent { label 'solidworks-vm1' }
+        //     steps {
+        //         bat 'robocopy C:\\ThreadRecognition\\BrepJson \\\\fileserver\\share\\BrepJson_Combined /MIR /XO'
+        //     }
+        // }
+    }
+
+    post {
+        success {
+            echo 'All VMs completed successfully.'
+        }
+        failure {
+            echo 'One or more VMs failed. Check the per-VM logs and archived heartbeat files.'
+        }
+        aborted {
+            echo 'Pipeline was aborted - orchestrator handled Ctrl-C gracefully on each VM.'
+        }
+    }
+}
+
+// Stage this VM's hash-sharded subset of SOURCE_STEPS into STEPS_FOLDER.
+// Idempotent: files already in the target are skipped, so re-runs are cheap.
+// Hardlinks are used when source and target are on the same volume.
+void stageShard(int shardIndex) {
+    bat """
+    python "${params.STAGE_SHARD_PY}" ^
+        --source "${params.SOURCE_STEPS}" ^
+        --target "${params.STEPS_FOLDER}" ^
+        --shard-index ${shardIndex} ^
+        --total-shards ${params.TOTAL_SHARDS}
+    """
+}
+
+// Invoke the CLI with the pipeline parameters.
+void runOrchestrator() {
+    bat """
+    "${params.CLI_EXE}" ^
+        --solidworks "${params.SOLIDWORKS_EXE}" ^
+        --macro "${params.MACRO_PATH}" ^
+        --steps "${params.STEPS_FOLDER}" ^
+        --status "${params.STATUS_FOLDER}" ^
+        --stall-timeout ${params.STALL_TIMEOUT} ^
+        --startup-grace ${params.STARTUP_GRACE}
+    """
+}

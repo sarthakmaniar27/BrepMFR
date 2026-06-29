@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 # Windows / conda: LLVM OpenMP (libomp) + Intel OpenMP (libiomp5) often load together — must set before torch/numpy.
-import os
+from __future__ import annotations
 
+import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import warnings
@@ -210,6 +211,31 @@ parser.add_argument(
         "weights. This counteracts the class-0 dominance (~58%% stock) and "
         "produces a less over-confident encoder, which closes the label-shift "
         "gap on target evaluation."
+    ),
+)
+parser.add_argument(
+    "--loss_type",
+    type=str,
+    default="ce",
+    choices=("ce", "focal"),
+    help=(
+        "Loss function for training. "
+        "'ce' = standard weighted cross-entropy (default). "
+        "'focal' = Focal Loss (Lin et al., ICCV 2017) which dynamically "
+        "down-weights easy examples via a (1-p_t)^gamma factor — effective "
+        "for severe class imbalance (e.g., 85%% text vs 0.8%% thread). "
+        "Combines with --class_weights_path for both easy-example suppression "
+        "and class-frequency correction."
+    ),
+)
+parser.add_argument(
+    "--focal_gamma",
+    type=float,
+    default=2.0,
+    help=(
+        "Focal Loss focusing parameter (only used when --loss_type focal). "
+        "gamma=0 reduces to CE; gamma=2.0 is the paper default. "
+        "Higher gamma more aggressively suppresses easy examples."
     ),
 )
 parser.add_argument(

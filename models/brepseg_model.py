@@ -69,6 +69,45 @@ def CrossEntropyLoss(label, predict_prob, class_level_weight=None, instance_leve
     return torch.sum(instance_level_weight * ce * class_level_weight) / float(N)
 
 
+def FocalLoss(label, predict_prob, gamma=2.0, class_level_weight=None, epsilon=1e-12):
+    """Focal Loss (Lin et al., ICCV 2017) for softmax probability outputs.
+
+    Dynamically down-weights easy examples via a (1 - p_t)^gamma modulating
+    factor.  When gamma=0 this reduces to standard cross-entropy.  gamma=2.0
+    is the paper's recommended default.
+
+    Works with the existing class_level_weight system: the per-class weight
+    scales the focal-modulated loss for each class, giving both the
+    easy-example suppression of Focal Loss AND the class-frequency correction
+    of weighted CE.
+
+    Args:
+        label:              One-hot encoded labels [N, C]
+        predict_prob:       Softmax probabilities   [N, C]
+        gamma:              Focusing parameter (0 = CE, 2.0 recommended)
+        class_level_weight: Per-class weight tensor [C] (optional)
+        epsilon:            Numerical stability constant
+    """
+    N, C = label.size()
+    assert predict_prob.size() == (N, C), 'fatal error: dimension mismatch!'
+
+    # p_t = probability assigned to the TRUE class for each sample
+    p_t = (label * predict_prob).sum(dim=-1)           # [N]
+    focal_weight = (1.0 - p_t) ** gamma                # [N]  high when wrong, ~0 when right
+    ce = -torch.log(p_t + epsilon)                      # [N]
+    loss = focal_weight * ce                            # [N]
+
+    if class_level_weight is not None:
+        if len(class_level_weight.size()) == 1:
+            class_level_weight = class_level_weight.view(1, class_level_weight.size(0))
+        # Per-sample class weight: pick the weight of the true class
+        true_class = label.argmax(dim=-1)                   # [N]
+        cw = class_level_weight.squeeze(0)[true_class]      # [N]
+        loss = loss * cw
+
+    return loss.sum() / float(N)
+
+
 class Attention(nn.Module):
     def __init__(self, in_channels):
         super().__init__()
@@ -161,14 +200,26 @@ class BrepSeg(pl.LightningModule):
         self.warmup_freeze_epochs = getattr(args, "warmup_freeze_epochs", 0)
 
         # ---------------------------------------------------------
+        # Loss function selection
+        # ---------------------------------------------------------
+        self.loss_type = getattr(args, "loss_type", "ce")
+        self.focal_gamma = float(getattr(args, "focal_gamma", 2.0))
+        if self.loss_type == "focal":
+            print(f"\nUsing Focal Loss (gamma={self.focal_gamma})")
+        else:
+            print(f"\nUsing Cross-Entropy Loss")
+
+        # ---------------------------------------------------------
         # Class-balanced loss weights
         # ---------------------------------------------------------
         # Stage 1 source training data is dominated by class 0 (~58% stock),
         # which produces an over-confident classifier and label-shift on target.
         # If --class_weights_path is provided, we load per-class weights from
-        # that JSON (computed by scripts/training/compute_class_weights.py) and apply
-        # them ONLY to the training-step CE loss. Validation loss stays
-        # unweighted so the LR scheduler sees a stable signal.
+        # that JSON (computed by scripts/training/compute_class_weights.py) and
+        # apply them to BOTH the training-step and validation-step loss so
+        # eval_loss reflects the true training objective (weighted CE or Focal
+        # Loss). The LR scheduler monitors per_class_accuracy (macro-averaged)
+        # instead of eval_loss to avoid the majority-class-dominated signal.
         self.class_weights_path = getattr(args, "class_weights_path", None)
         if self.class_weights_path and not pathlib.Path(
             self.class_weights_path
@@ -288,7 +339,6 @@ class BrepSeg(pl.LightningModule):
         self.brep_encoder.train()
         self.attention.train()
         self.classifier.train()
-        torch.cuda.empty_cache()
 
         # brep encoder----------------------------------------------------------------------------------
         with torch.profiler.record_function("brep_encoder"):
@@ -315,7 +365,10 @@ class BrepSeg(pl.LightningModule):
             # When unused, self.class_weights is all-1.0 and the result is identical
             # to unweighted CE, but we still pass None to skip a few ops.
             cw = self.class_weights if self.use_class_weights else None
-            loss = CrossEntropyLoss(labels_onehot, node_seg, class_level_weight=cw)
+            if self.loss_type == "focal":
+                loss = FocalLoss(labels_onehot, node_seg, gamma=self.focal_gamma, class_level_weight=cw)
+            else:
+                loss = CrossEntropyLoss(labels_onehot, node_seg, class_level_weight=cw)
         bs = int(labels.shape[0])
         self.log(
             "train_loss",
@@ -339,7 +392,6 @@ class BrepSeg(pl.LightningModule):
         self.brep_encoder.eval()
         self.attention.eval()
         self.classifier.eval()
-        torch.cuda.empty_cache()
 
         with torch.profiler.record_function("brep_encoder"):
             node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)  # logits [total_nodes, num_classes]
@@ -360,7 +412,19 @@ class BrepSeg(pl.LightningModule):
             labels = batch["label_feature"].long()  # labels [total_nodes]
             labels_np = labels.long().detach().cpu().numpy()
             labels_onehot = F.one_hot(labels, self.num_classes)
-            loss = CrossEntropyLoss(labels_onehot, node_seg)
+            # Use the SAME loss as training_step (weighted CE or Focal Loss +
+            # class weights) so eval_loss reflects the true training objective
+            # rather than a majority-class-dominated plain CE.
+            cw = self.class_weights if self.use_class_weights else None
+            if self.loss_type == "focal":
+                loss = FocalLoss(
+                    labels_onehot, node_seg,
+                    gamma=self.focal_gamma, class_level_weight=cw,
+                )
+            else:
+                loss = CrossEntropyLoss(
+                    labels_onehot, node_seg, class_level_weight=cw,
+                )
             self.log(
                 "eval_loss",
                 loss,
@@ -398,6 +462,50 @@ class BrepSeg(pl.LightningModule):
         self.label = []
         per_face_comp = (preds_np == labels_np).astype(np.int64)
         self.log("per_face_accuracy", np.mean(per_face_comp))
+
+        # ---------------------------------------------------------
+        # Per-class accuracy — critical for imbalanced datasets
+        # where per_face_accuracy is dominated by the majority class.
+        # ---------------------------------------------------------
+        per_class_acc = []
+        for i in range(self.num_classes):
+            class_pos = np.where(labels_np == i)
+            if len(class_pos[0]) > 0:
+                class_i_preds = preds_np[class_pos]
+                class_i_label = labels_np[class_pos]
+                acc = float(np.mean((class_i_preds == class_i_label).astype(np.int64)))
+                per_class_acc.append(acc)
+                self.log(f"val_class_{i}_acc", acc)
+            else:
+                per_class_acc.append(0.0)
+        if per_class_acc:
+            self.log("per_class_accuracy", float(np.mean(per_class_acc)))
+
+        # Feature-only accuracy (excludes stock = class 0)
+        feature_pos = np.where(labels_np > 0)
+        if len(feature_pos[0]) > 0:
+            feature_pred = preds_np[feature_pos]
+            feature_label = labels_np[feature_pos]
+            feature_acc = float(np.mean((feature_pred == feature_label).astype(np.int64)))
+            self.log("per_face_accuracy_feature", feature_acc)
+
+        # IoU
+        per_class_iou = []
+        for i in range(self.num_classes):
+            label_pos = np.where(labels_np == i)[0]
+            pred_pos = np.where(preds_np == i)[0]
+            if len(pred_pos) > 0 and len(label_pos) > 0:
+                class_i_preds = preds_np[label_pos]
+                class_i_label = labels_np[label_pos]
+                intersection = (class_i_preds == class_i_label).astype(np.int64)
+                union_fn = (class_i_preds != class_i_label).astype(np.int64)
+                class_i_preds_ = preds_np[pred_pos]
+                class_i_label_ = labels_np[pred_pos]
+                union_fp = (class_i_preds_ != class_i_label_).astype(np.int64)
+                iou = float(np.sum(intersection) / (np.sum(union_fn) + np.sum(intersection) + np.sum(union_fp) + 1e-9))
+                per_class_iou.append(iou)
+        if per_class_iou:
+            self.log("IoU", float(np.mean(per_class_iou)))
 
         if self.trainer.is_global_zero:
             from models.tensorboard_media import log_segmentation_val_media
@@ -571,9 +679,16 @@ class BrepSeg(pl.LightningModule):
             weight_decay=0.01,
         )
 
+        # Monitor per_class_accuracy (macro-averaged, computed in
+        # on_validation_epoch_end) instead of eval_loss.  On imbalanced data
+        # eval_loss is dominated by the majority class, so a scheduler that
+        # watches it will shrink the LR whenever Focal Loss / class weights
+        # shift probability mass toward minority classes — even when macro
+        # accuracy is improving.  per_class_accuracy treats every class
+        # equally, so the scheduler now reacts to real segmentation progress.
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
-            mode='min',
+            mode='max',
             factor=0.5,
             patience=5,
             threshold=1e-4,
@@ -588,7 +703,7 @@ class BrepSeg(pl.LightningModule):
                 "scheduler": scheduler,
                 "interval": "epoch",
                 "frequency": 1,
-                "monitor": "eval_loss",
+                "monitor": "per_class_accuracy",
             },
         }
 
