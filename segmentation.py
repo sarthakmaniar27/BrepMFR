@@ -247,6 +247,49 @@ parser.add_argument(
         "Example: `output/bin_skip_a2` for zero-A2 ablation graphs."
     ),
 )
+
+# --------------------------------------------------------------------------------------
+# Subgraph training (k-hop neighborhoods). Completely opt-in.
+# When disabled (default), CADSynth returns full graphs exactly as before.
+# --------------------------------------------------------------------------------------
+parser.add_argument(
+    "--subgraph_training",
+    action="store_true",
+    help=(
+        "Enable subgraph training: for each loaded graph, sample a small number of seed faces "
+        "(balanced across classes) and train only on their k-hop union neighborhood. "
+        "This is one of the most effective ways to combat extreme face-level class imbalance "
+        "(e.g. huge text regions vs small thread regions) because you control *how many seeds* "
+        "of each class the model sees per step instead of how many faces a feature happens to have."
+    ),
+)
+parser.add_argument(
+    "--subgraph_k_hop",
+    type=int,
+    default=2,
+    help="Hop radius for subgraph extraction (2 or 3 recommended). Larger = more context, smaller = faster + more focused.",
+)
+parser.add_argument(
+    "--subgraph_seeds_per_class",
+    type=str,
+    default="2,3,3",
+    help=(
+        "Comma-separated max seeds to draw per class (positional). "
+        "Example for a 3-class thread/text problem: '2,3,3' means up to 2 stock + 3 thread + 3 text seeds per original graph. "
+        "Fewer seeds are taken if a class is absent in that part. "
+        "Use '0:2,1:3,2:3' syntax for explicit class ids if you have >3 classes."
+    ),
+)
+parser.add_argument(
+    "--subgraph_on_val",
+    action="store_true",
+    help="Also apply subgraph sampling to the validation set (default: val uses full graphs for comparable metrics).",
+)
+parser.add_argument(
+    "--subgraph_on_test",
+    action="store_true",
+    help="Also apply subgraph sampling at test time (rarely useful; default keeps full graphs).",
+)
 parser.add_argument(
     "--use_wandb",
     action="store_true",
@@ -479,6 +522,11 @@ def main():
                 "precision": args.precision,
                 "max_graph_nodes": args.max_graph_nodes,
                 "drop_invalid_graphs": bool(args.drop_invalid_graphs),
+                "subgraph_training": bool(args.subgraph_training),
+                "subgraph_k_hop": int(args.subgraph_k_hop),
+                "subgraph_seeds_per_class": args.subgraph_seeds_per_class,
+                "subgraph_on_val": bool(args.subgraph_on_val),
+                "subgraph_on_test": bool(args.subgraph_on_test),
             },
             repo_root=repo_root,
             tb_full_graph=args.tb_full_graph,
@@ -554,6 +602,11 @@ Best checkpoint:
 
         model = BrepSeg(args)
 
+        # Stash a back-reference so the model can advance subgraph_epoch each epoch
+        # (gives different random crops of the same part across epochs when using
+        # --subgraph_training). No effect when subgraph_training is off.
+        model._train_dataset_for_subgraph = None
+
         train_data = Dataset(
             root_dir=args.dataset_path,
             split="train",
@@ -562,7 +615,14 @@ Best checkpoint:
             pt_subdir=args.pt_subdir,
             max_graph_nodes=args.max_graph_nodes,
             drop_invalid_graphs=args.drop_invalid_graphs,
+            # Subgraph training (defaults keep old full-graph behavior)
+            subgraph_training=args.subgraph_training,
+            subgraph_k_hop=args.subgraph_k_hop,
+            subgraph_seeds_per_class=args.subgraph_seeds_per_class,
+            subgraph_on_nontrain=args.subgraph_on_val,  # val controlled separately
+            subgraph_global_seed=42,
         )
+        model._train_dataset_for_subgraph = train_data
         val_data = Dataset(
             root_dir=args.dataset_path,
             split="val",
@@ -571,6 +631,11 @@ Best checkpoint:
             pt_subdir=args.pt_subdir,
             max_graph_nodes=args.max_graph_nodes,
             drop_invalid_graphs=args.drop_invalid_graphs,
+            subgraph_training=args.subgraph_training and args.subgraph_on_val,
+            subgraph_k_hop=args.subgraph_k_hop,
+            subgraph_seeds_per_class=args.subgraph_seeds_per_class,
+            subgraph_on_nontrain=args.subgraph_on_val,
+            subgraph_global_seed=42,
         )
         train_loader = train_data.get_dataloader(
             batch_size=args.batch_size,
@@ -618,6 +683,11 @@ Best checkpoint:
             pt_subdir=args.pt_subdir,
             max_graph_nodes=args.max_graph_nodes,
             drop_invalid_graphs=args.drop_invalid_graphs,
+            subgraph_training=args.subgraph_training and args.subgraph_on_test,
+            subgraph_k_hop=args.subgraph_k_hop,
+            subgraph_seeds_per_class=args.subgraph_seeds_per_class,
+            subgraph_on_nontrain=args.subgraph_on_test,
+            subgraph_global_seed=42,
         )
         test_loader = test_data.get_dataloader(
             batch_size=args.batch_size,

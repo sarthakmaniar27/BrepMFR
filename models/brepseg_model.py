@@ -335,6 +335,12 @@ class BrepSeg(pl.LightningModule):
             for p in self.brep_encoder.parameters():
                 p.requires_grad = True
 
+        # If subgraph training is active, advance the epoch so the *same* CAD file
+        # yields different random k-hop neighborhoods on subsequent epochs.
+        ds = getattr(self, "_train_dataset_for_subgraph", None)
+        if ds is not None and hasattr(ds, "subgraph_epoch"):
+            ds.subgraph_epoch = int(self.current_epoch)
+
     def training_step(self, batch, batch_idx):
         self.brep_encoder.train()
         self.attention.train()

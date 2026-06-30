@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import pathlib
-from typing import Optional
+from typing import Optional, Sequence, Union
 from tqdm import tqdm
 import random
 import torch
@@ -12,6 +12,11 @@ from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data as PYGGraph
 from .collator import collator, collator_st
 from .utils import get_random_rotation, rotate_uvgrid
+from .subgraph_sampler import (
+    make_rng_for_index,
+    parse_seeds_per_class,
+    sample_balanced_subgraph,
+)
 
 
 def _load_pyg_sample(path: pathlib.Path) -> PYGGraph:
@@ -140,6 +145,15 @@ class CADSynth(Dataset):
         pt_subdir=None,
         max_graph_nodes: Optional[int] = None,
         drop_invalid_graphs: bool = False,
+        *,
+        # ------------------------------------------------------------------
+        # Subgraph training (opt-in; default = False preserves old behavior)
+        # ------------------------------------------------------------------
+        subgraph_training: bool = False,
+        subgraph_k_hop: int = 2,
+        subgraph_seeds_per_class: Optional[Union[str, Sequence[int]]] = None,
+        subgraph_on_nontrain: bool = False,
+        subgraph_global_seed: int = 42,
     ):
         assert split in ("train", "val", "test")
         path = pathlib.Path(root_dir)
@@ -149,6 +163,21 @@ class CADSynth(Dataset):
         self.pt_subdir = pt_subdir
         self.max_graph_nodes = max_graph_nodes
         self.drop_invalid_graphs = bool(drop_invalid_graphs)
+
+        # Subgraph sampling configuration (ignored when subgraph_training=False)
+        self.subgraph_training = bool(subgraph_training)
+        self.subgraph_k_hop = int(subgraph_k_hop)
+        # Store a concrete list for fast path; support string specs from CLI
+        if subgraph_seeds_per_class is None:
+            self.subgraph_seeds_per_class = None
+        else:
+            parsed = parse_seeds_per_class(subgraph_seeds_per_class, num_class)
+            self.subgraph_seeds_per_class = [int(x) for x in parsed]
+        self.subgraph_on_nontrain = bool(subgraph_on_nontrain)
+        self.subgraph_global_seed = int(subgraph_global_seed)
+        # Can be bumped by training code each epoch for more variety on the same file
+        self.subgraph_epoch = 0
+
         self.file_paths = []
         self._get_filenames(path, filelist=split + ".txt")
         if self.drop_invalid_graphs or self.max_graph_nodes is not None:
@@ -233,6 +262,28 @@ class CADSynth(Dataset):
     def __getitem__(self, idx):
         fn = self.file_paths[idx]
         sample = self.load_one_graph(fn)
+
+        # ------------------------------------------------------------------
+        # Optional subgraph training path (disabled by default)
+        # When enabled, we replace the full graph with a small k-hop union
+        # around a class-balanced set of seed faces. All tensors are sliced
+        # so the collator / encoder / loss see a perfectly normal mini-graph.
+        # ------------------------------------------------------------------
+        if self.subgraph_training and (self.split == "train" or self.subgraph_on_nontrain):
+            rng = make_rng_for_index(
+                self.subgraph_global_seed,
+                getattr(self, "subgraph_epoch", 0),
+                int(idx),
+                self.split,
+            )
+            seeds_spec = self.subgraph_seeds_per_class or (2, 3, 3)
+            sample = sample_balanced_subgraph(
+                sample,
+                k_hop=self.subgraph_k_hop,
+                seeds_per_class=seeds_spec,
+                num_classes=self.num_class,
+                rng=rng,
+            )
         return sample
 
     def _collate(self, batch):

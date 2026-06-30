@@ -121,6 +121,46 @@ conda run -n brep_mfr_pyg python segmentation.py train `
 
 Tune `--batch_size` / `--accumulate_grad_batches` / `--precision` / `--max_graph_nodes` for VRAM like the [thread README](README.md) OOM section.
 
+## Subgraph Training (k-hop neighborhoods) — Recommended for Severe Imbalance
+
+The biggest lever against "text walls drowning thread signals" is to stop training on whole graphs.
+
+Instead of feeding a 4000-face part, sample a handful of seeds (balanced across classes) and train only on their local 2-hop or 3-hop neighborhoods.
+
+**This is fully opt-in and 100 % backward compatible.** Omit the flags and you get the exact old full-graph workflow.
+
+### Quick start (Stage 1)
+
+```powershell
+conda run -n brep_mfr_pyg python segmentation.py train `
+  --dataset_path D:\thread_and_text\merged_lite `
+  --pt_subdir pyg `
+  --num_classes 3 `
+  --drop_invalid_graphs `
+  --class_weights_path artifacts/class_weights/thread_text/source_train_alpha05.json `
+  --batch_size 1 --accumulate_grad_batches 32 --precision 16-mixed `
+  --max_epochs 100 --num_workers 0 `
+  --loss_type focal `
+  --subgraph_training --subgraph_k_hop 2 --subgraph_seeds_per_class "2,3,3" `
+  --run_name thread_text_subgraph_k2_s233_$(Get-Date -Format 'yyyyMMdd_HHmmss')
+```
+
+What the flags mean:
+- `--subgraph_training` — turn the feature on (default off = full graphs).
+- `--subgraph_k_hop 2` — take faces reachable in ≤2 adjacency hops from each seed (sweet spot).
+- `--subgraph_seeds_per_class "2,3,3"` — per original CAD part, draw at most 2 stock + 3 thread + 3 text seeds (if present). The model therefore sees a *balanced number of seeds*, not a balanced number of faces dictated by feature size.
+- Validation stays on full graphs by default (good for comparable metrics). Add `--subgraph_on_val` only if you want to experiment.
+
+Because each original part now contributes several small, class-balanced "views", the gradient sees far more thread signal per epoch and text no longer dominates by sheer face count.
+
+You can go back to the previous behavior at any moment by deleting the three `--subgraph_*` flags from the command.
+
+### How it interacts with everything else
+- Class weights and Focal Loss still apply inside the subgraphs (they are just smaller).
+- Random rotation is applied to the whole part first, then we crop — local geometry stays correctly oriented.
+- The epoch counter is advanced automatically so the same part yields different random subgraphs on epoch N vs N+1.
+- All checkpoints, LR scheduling on `per_class_accuracy`, TensorBoard extras, etc. continue to work.
+
 ## Related
 
 - 2-class thread-only flow: [README.md](README.md)
