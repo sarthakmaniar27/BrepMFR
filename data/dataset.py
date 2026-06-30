@@ -17,6 +17,7 @@ from .subgraph_sampler import (
     parse_seeds_per_class,
     sample_balanced_subgraph,
 )
+from .length_bucket_batch_sampler import LengthBucketBatchSampler
 
 
 def _load_pyg_sample(path: pathlib.Path) -> PYGGraph:
@@ -106,15 +107,30 @@ def _make_dataloader(
     *,
     prefetch_factor: int | None = None,
     pin_memory: bool = False,
+    batch_sampler=None,
 ):
     """Workers use torch ``DataLoader`` only (no stacked prefetch on Windows).
 
     ``num_workers==0`` uses a vanilla ``DataLoader``—BackgroundGenerator-style wrappers
     were removed after stuck-after-sanity reports on Windows + Lightning + CUDA.
+
+    When ``batch_sampler`` is provided (a :class:`LengthBucketBatchSampler`),
+    ``batch_size`` / ``shuffle`` / ``drop_last`` are NOT forwarded to ``DataLoader``
+    because PyTorch forbids specifying them alongside a batch_sampler.
     """
     dl_kw = _dataloader_kw(
         num_workers, prefetch_factor=prefetch_factor, pin_memory=pin_memory
     )
+    if batch_sampler is not None:
+        # batch_sampler is mutually exclusive with batch_size, shuffle, sampler,
+        # AND drop_last. _dataloader_kw includes drop_last=True, so strip it.
+        sampler_kw = {k: v for k, v in dl_kw.items() if k != "drop_last"}
+        return DataLoader(
+            dataset=dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
+            **sampler_kw,
+        )
     if num_workers > 0:
         return DataLoader(
             dataset=dataset,
@@ -179,14 +195,25 @@ class CADSynth(Dataset):
         self.subgraph_epoch = 0
 
         self.file_paths = []
+        # Actual node counts per kept file — populated by _filter_graphs_by_constraints
+        # when that scan runs (i.e. when --drop_invalid_graphs or --max_graph_nodes is set).
+        # Used by get_dataloader(length_bucket_batching=True) for accurate bucketing.
+        self._actual_node_counts: list[int] = []
         self._get_filenames(path, filelist=split + ".txt")
         if self.drop_invalid_graphs or self.max_graph_nodes is not None:
             self._filter_graphs_by_constraints()
 
     def _filter_graphs_by_constraints(self) -> None:
-        """Drop empty graphs and optionally graphs larger than ``max_graph_nodes``."""
+        """Drop empty graphs and optionally graphs larger than ``max_graph_nodes``.
+
+        As a side-effect, populates ``self._actual_node_counts`` with the true
+        node count for every kept graph.  This is consumed by
+        ``get_dataloader(length_bucket_batching=True)`` so the batch sampler
+        uses verified counts instead of parsing the filename.
+        """
         cap = self.max_graph_nodes
         kept: list[pathlib.Path] = []
+        kept_counts: list[int] = []
         dropped_bad = 0
         dropped_large = 0
         parts = []
@@ -210,6 +237,7 @@ class CADSynth(Dataset):
                 dropped_large += 1
                 continue
             kept.append(pathlib.Path(p))
+            kept_counts.append(n)
         print(
             f"Graph filter ({desc}): kept {len(kept):,} | "
             f"dropped_bad={dropped_bad:,} dropped_large={dropped_large:,} "
@@ -217,6 +245,7 @@ class CADSynth(Dataset):
             flush=True,
         )
         self.file_paths = kept
+        self._actual_node_counts = kept_counts
 
     def _get_filenames(self, root_dir, filelist):
         print(f"Loading data...")
@@ -300,7 +329,26 @@ class CADSynth(Dataset):
         num_workers=0,
         prefetch_factor=None,
         pin_memory=False,
+        length_bucket_batching: bool = False,
     ):
+        batch_sampler = None
+        if length_bucket_batching:
+            # Prefer actual node counts collected during _filter_graphs_by_constraints
+            # (populated when --drop_invalid_graphs or --max_graph_nodes is used).
+            # Falls back to filename parsing when the scan wasn't run, but files whose
+            # names don't contain a face count are then conservatively treated as large
+            # (bs=1) to prevent O(N²) OOM from unexpectedly large graphs.
+            node_counts = self._actual_node_counts if self._actual_node_counts else None
+            batch_sampler = LengthBucketBatchSampler(
+                self.file_paths,
+                base_batch_size=batch_size,
+                shuffle=shuffle,
+                node_counts=node_counts,
+            )
+            print(
+                f"  total batches={len(batch_sampler)}",
+                flush=True,
+            )
         return _make_dataloader(
             self,
             self._collate,
@@ -309,6 +357,7 @@ class CADSynth(Dataset):
             num_workers,
             prefetch_factor=prefetch_factor,
             pin_memory=pin_memory,
+            batch_sampler=batch_sampler,
         )
 
 

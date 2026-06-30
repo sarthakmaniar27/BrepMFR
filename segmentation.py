@@ -140,6 +140,17 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--length_bucket_batching",
+    action="store_true",
+    help=(
+        "Use a length-bucketed batch sampler: graphs with <=150 faces use --batch_size, "
+        "151-300 faces use batch_size//2, >300 faces use batch_size=1. Prevents OOM spikes "
+        "from O(N^2) attention on large graphs while keeping ALL training data (including "
+        "the 0.09%% of graphs with >500 faces). Recommended when training on mixed-size "
+        "BrepMFR data and hitting intermittent CUDA OOM at random epochs."
+    ),
+)
+parser.add_argument(
     "--cuda_launch_blocking",
     action="store_true",
     help="Set CUDA_LAUNCH_BLOCKING=1 before training (CUDA debug only — large slowdown).",
@@ -643,6 +654,7 @@ Best checkpoint:
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
             prefetch_factor=args.dataloader_prefetch_factor,
+            length_bucket_batching=args.length_bucket_batching,
         )
         val_loader = val_data.get_dataloader(
             batch_size=args.batch_size,
@@ -650,6 +662,7 @@ Best checkpoint:
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
             prefetch_factor=args.dataloader_prefetch_factor,
+            length_bucket_batching=args.length_bucket_batching,
         )
         if len(train_data) == 0:
             raise RuntimeError(
