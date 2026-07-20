@@ -602,18 +602,56 @@ class DomainAdapt(pl.LightningModule):
         self.log("per_face_accuracy_target_feature", np.mean(per_face_comp_feature))
         print("per_face_accuracy_feature: %s" % np.mean(per_face_comp_feature))
 
-        # Per-class accuracy
+        # Per-class accuracy / precision / recall (one entry per training class)
+        _default_names = {0: "Stock", 1: "Thread", 2: "Text"}
+
+        def _class_name(i: int) -> str:
+            return _default_names.get(i, f"class_{i}")
+
         per_class_acc = []
+        per_class_precision = []
+        per_class_recall = []
+        print("\nPer-class precision / recall / accuracy (target):")
+        print(f"  {'class':<10} {'precision':>10} {'recall':>10} {'accuracy':>10} {'support':>10} {'pred_n':>10}")
         for i in range(0, self.num_classes):
-            class_pos = np.where(label_t_np == i)
-            if len(class_pos[0]) > 0:
-                class_i_preds = pred_t_np[class_pos]
-                class_i_label = label_t_np[class_pos]
-                per_face_comp = (class_i_preds == class_i_label).astype(np.int64)
-                per_class_acc.append(np.mean(per_face_comp))
-                print("class_%s_acc: %s" % (i + 1, np.mean(per_face_comp)))
-        self.log("per_class_accuracy", np.mean(per_class_acc))
-        print("per_class_accuracy: %s" % np.mean(per_class_acc))
+            name = _class_name(i)
+            label_pos = np.where(label_t_np == i)[0]
+            pred_pos = np.where(pred_t_np == i)[0]
+            support = int(len(label_pos))
+            pred_n = int(len(pred_pos))
+            tp = int(np.sum(pred_t_np[label_pos] == i)) if support > 0 else 0
+
+            recall = float(tp / support) if support > 0 else 0.0
+            precision = float(tp / pred_n) if pred_n > 0 else 0.0
+            acc = recall
+
+            per_class_acc.append(acc)
+            per_class_precision.append(precision)
+            per_class_recall.append(recall)
+
+            self.log(f"test_class_{i}_acc", acc)
+            self.log(f"test_class_{i}_precision", precision)
+            self.log(f"test_class_{i}_recall", recall)
+            if i in _default_names:
+                self.log(f"test_{name}_precision", precision)
+                self.log(f"test_{name}_recall", recall)
+                self.log(f"test_{name}_acc", acc)
+
+            print(
+                f"  {name:<10} {precision:10.4f} {recall:10.4f} {acc:10.4f} "
+                f"{support:10d} {pred_n:10d}"
+            )
+
+        if per_class_acc:
+            macro_acc = float(np.mean(per_class_acc))
+            macro_p = float(np.mean(per_class_precision))
+            macro_r = float(np.mean(per_class_recall))
+            self.log("per_class_accuracy", macro_acc)
+            self.log("macro_precision", macro_p)
+            self.log("macro_recall", macro_r)
+            print("per_class_accuracy (macro): %s" % macro_acc)
+            print("macro_precision: %s" % macro_p)
+            print("macro_recall: %s" % macro_r)
 
         # IoU
         per_class_iou = []

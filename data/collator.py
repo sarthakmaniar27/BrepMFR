@@ -132,7 +132,12 @@ def _maybe_float32_features(node_data, edge_data, face_area):
     return node_data, edge_data, face_area
 
 
-def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, PYGGraph_1_mian}, {PYGGraph_2, PYGGraph_2_mian}, ..., PYGGraph_batchsize)
+def collator(
+    items,
+    multi_hop_max_dist,
+    spatial_pos_max,
+    max_nodes_for_a3=None,
+):  #items({PYGGraph_1, PYGGraph_1_mian}, {PYGGraph_2, PYGGraph_2_mian}, ..., PYGGraph_batchsize)
     batch_has_a2 = _require_homogeneous("has_a2", [_item_has_a2(x) for x in items])
     batch_has_a1 = _require_homogeneous("has_a1", [_item_has_a1(x) for x in items])
     batch_has_a3 = _require_homogeneous("has_a3", [_item_has_a3(x) for x in items])
@@ -201,7 +206,10 @@ def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, P
         
     max_node_num = max(i.size(0) for i in node_datas)
     max_edge_num = max(i.size(0) for i in edge_datas)
-    if batch_has_a3:
+    run_batch_a3 = batch_has_a3 and (
+        max_nodes_for_a3 is None or max_node_num <= int(max_nodes_for_a3)
+    )
+    if run_batch_a3:
         max_dist = max(i.size(-1) for i in edge_paths if i is not None)
         max_dist = max(max_dist, multi_hop_max_dist)
     else:
@@ -225,7 +233,7 @@ def collator(items, multi_hop_max_dist, spatial_pos_max):  #items({PYGGraph_1, P
     edge_ang = torch.cat([i for i in edge_angs])
     edge_conv = torch.cat([i for i in edge_convs])
     
-    if batch_has_a3:
+    if run_batch_a3:
         edge_path = torch.cat(
             [pad_3d_unsqueeze(i, max_node_num, max_node_num, max_dist) for i in edge_paths]
         ).long()

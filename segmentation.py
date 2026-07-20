@@ -209,6 +209,58 @@ parser.add_argument("--dim_node", type=int, default=256)
 parser.add_argument("--n_heads", type=int, default=32)
 parser.add_argument("--n_layers_encode", type=int, default=8)
 parser.add_argument("--warmup_freeze_epochs", type=int, default=3)
+parser.add_argument(
+    "--learning_rate",
+    "--learning-rate",
+    type=float,
+    default=0.002,
+    help="AdamW learning rate for the pretrained backbone/classifier (default: 0.002).",
+)
+parser.add_argument(
+    "--a1_a3_learning_rate",
+    "--a1-a3-learning-rate",
+    type=float,
+    default=None,
+    help=(
+        "Optional separate AdamW learning rate for brep_encoder.graph_attn_bias. "
+        "Use a higher value than --learning_rate when introducing previously unused A1/A3 branches."
+    ),
+)
+parser.add_argument(
+    "--optimizer_warmup_steps",
+    "--optimizer-warmup-steps",
+    type=int,
+    default=5000,
+    help="Linearly warm each optimizer parameter group to its configured learning rate.",
+)
+parser.add_argument(
+    "--a1_a3_ramp_epochs",
+    "--a1-a3-ramp-epochs",
+    type=int,
+    default=0,
+    help=(
+        "Gradually increase A1/A3 attention-bias contribution to 1.0 over this many epochs. "
+        "Use 5 when fine-tuning a lite checkpoint; 0 applies full A1/A3 immediately."
+    ),
+)
+parser.add_argument(
+    "--a1_a3_start_scale",
+    "--a1-a3-start-scale",
+    type=float,
+    default=0.1,
+    help="Initial A1/A3 multiplier when --a1_a3_ramp_epochs is enabled (default: 0.1).",
+)
+parser.add_argument(
+    "--max_nodes_for_a3",
+    "--max-nodes-for-a3",
+    type=int,
+    default=None,
+    metavar="N",
+    help=(
+        "Skip dense A3 collation/encoding for batches padded above N faces while retaining A1. "
+        "Recommended: 768 for mixed-size training. Use 0 for no cap."
+    ),
+)
 parser.add_argument("--max_epochs", type=int, default=1000)
 parser.add_argument("--log_every_n_steps", type=int, default=50)
 parser.add_argument(
@@ -471,6 +523,20 @@ def main():
     # guard around training setup, every worker re-imports this module and tries to
     # restart training, eventually crashing in `_check_not_importing_main`.
     args = parser.parse_args()
+    if args.pre_train and args.resume_from_checkpoint:
+        parser.error("Use only one of --pre_train (fresh fine-tune state) or --resume_from_checkpoint (exact resume).")
+    if args.learning_rate <= 0:
+        parser.error("--learning_rate must be > 0")
+    if args.a1_a3_learning_rate is not None and args.a1_a3_learning_rate <= 0:
+        parser.error("--a1_a3_learning_rate must be > 0")
+    if args.optimizer_warmup_steps < 0:
+        parser.error("--optimizer_warmup_steps must be >= 0")
+    if args.a1_a3_ramp_epochs < 0:
+        parser.error("--a1_a3_ramp_epochs must be >= 0")
+    if not 0.0 <= args.a1_a3_start_scale <= 1.0:
+        parser.error("--a1_a3_start_scale must be in [0, 1]")
+    if args.max_nodes_for_a3 is not None and args.max_nodes_for_a3 <= 0:
+        args.max_nodes_for_a3 = None
     if args.traintest == "train" and args.train_log_file:
         _maybe_tee_train_log(args.train_log_file)
     if args.cuda_launch_blocking:
@@ -533,6 +599,12 @@ def main():
                 "precision": args.precision,
                 "max_graph_nodes": args.max_graph_nodes,
                 "drop_invalid_graphs": bool(args.drop_invalid_graphs),
+                "learning_rate": float(args.learning_rate),
+                "a1_a3_learning_rate": args.a1_a3_learning_rate,
+                "optimizer_warmup_steps": int(args.optimizer_warmup_steps),
+                "a1_a3_ramp_epochs": int(args.a1_a3_ramp_epochs),
+                "a1_a3_start_scale": float(args.a1_a3_start_scale),
+                "max_nodes_for_a3": args.max_nodes_for_a3,
                 "subgraph_training": bool(args.subgraph_training),
                 "subgraph_k_hop": int(args.subgraph_k_hop),
                 "subgraph_seeds_per_class": args.subgraph_seeds_per_class,
@@ -625,6 +697,7 @@ Best checkpoint:
             num_class=args.num_classes,
             pt_subdir=args.pt_subdir,
             max_graph_nodes=args.max_graph_nodes,
+            max_nodes_for_a3=args.max_nodes_for_a3,
             drop_invalid_graphs=args.drop_invalid_graphs,
             # Subgraph training (defaults keep old full-graph behavior)
             subgraph_training=args.subgraph_training,
@@ -641,6 +714,7 @@ Best checkpoint:
             num_class=args.num_classes,
             pt_subdir=args.pt_subdir,
             max_graph_nodes=args.max_graph_nodes,
+            max_nodes_for_a3=args.max_nodes_for_a3,
             drop_invalid_graphs=args.drop_invalid_graphs,
             subgraph_training=args.subgraph_training and args.subgraph_on_val,
             subgraph_k_hop=args.subgraph_k_hop,
@@ -695,6 +769,7 @@ Best checkpoint:
             num_class=args.num_classes,
             pt_subdir=args.pt_subdir,
             max_graph_nodes=args.max_graph_nodes,
+            max_nodes_for_a3=args.max_nodes_for_a3,
             drop_invalid_graphs=args.drop_invalid_graphs,
             subgraph_training=args.subgraph_training and args.subgraph_on_test,
             subgraph_k_hop=args.subgraph_k_hop,

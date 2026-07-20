@@ -44,7 +44,7 @@ CLI flags mirror the base script plus `--profile`, `--cache-dir`, `--use-npz-cac
 The multi-hop edge bias path (`GraphAttnBias`, A3) gathers edge features along a dense tensor of length **≈ N×N×`multi_hop_max_dist`** per graph. Large mechanical meshes (many thousands of faces) can request **hundreds of GiB** and fail with `CUDA out of memory` at `edge_feature[dim_0, edge_path]`.
 
 - **Inference scripts** (`run_pyg_inference.py`, `export_uv_json_pred.py`, `step_infer_features.py`) default to **`--max_nodes_for_a3 768`**: A3 is skipped (with a one-time warning) when the padded node count exceeds that cap; A1 spatial bias still runs. Use **`--max_nodes_for_a3 0`** to disable the cap if you have enough GPU memory and need full A3 on huge graphs.
-- **Training** leaves the cap unset (`None` = no limit), so behavior matches earlier code unless you add `max_nodes_for_a3` to your training args.
+- **Training** leaves the cap unset by default (`None` = no limit). Pass `--max_nodes_for_a3 N` to skip A3 in the collator before allocating/transferring its dense padded tensor for batches above `N`; A1 remains active. Use `0` for no cap.
 - **Alternative:** Regenerate graphs with **`inference_profile=lite`**, which omits `edge_path` / A1 so memory scales with edges, not N².
 
 ## TensorBoard tracing

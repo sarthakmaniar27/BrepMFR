@@ -203,7 +203,7 @@ class GraphNodeFeature(nn.Module):
         # x [total_node_num, U_grid, V_grid, pnt_feature]
         # padding_mask [batch_size, max_node_num] 记录每个graph的实际长度，空位记为True
         n_graph, n_node = padding_mask.size()[:2]
-        node_pos = torch.where(padding_mask == False)
+        node_pos = torch.where(~padding_mask)
 
         x = x.permute(0, 3, 1, 2)
         x_ = self.surf_encoder(x)  # [total_nodes, n_hidden]
@@ -337,6 +337,11 @@ class GraphAttnBias(nn.Module):
         self.multi_hop_max_dist = multi_hop_max_dist
         # A3 gathers O(n^2 * max_dist) edge indices; None = no cap (training / large GPUs).
         self.max_nodes_for_a3 = max_nodes_for_a3
+        # Multiplier for the A1 shortest-path and A3 multi-hop edge biases.
+        # It is a buffer so the exact scale used by a validation checkpoint is
+        # restored for inference.  Lite-trained checkpoints predate this buffer;
+        # BrepSeg.on_load_checkpoint supplies a backward-compatible default.
+        self.register_buffer("a1_a3_scale", torch.tensor(1.0, dtype=torch.float32))
 
         # spatial_feature encode
         self.spatial_pos_encoder = nn.Embedding(num_spatial, num_heads, padding_idx=0)
@@ -365,6 +370,13 @@ class GraphAttnBias(nn.Module):
             )
 
         self.apply(lambda module: init_params(module, n_layers=n_layers))
+
+    def set_a1_a3_scale(self, scale: float) -> None:
+        """Set the shared A1/A3 contribution multiplier without changing model shape."""
+        value = float(scale)
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
+            raise ValueError(f"A1/A3 scale must be finite and in [0, 1], got {scale!r}")
+        self.a1_a3_scale.fill_(value)
 
     def forward(self, attn_bias, spatial_pos, d2_distance, ang_distance, edge_data, edge_type, edge_len, edge_ang, edge_conv, edge_path, edge_padding_mask, edge_index, node_feat):
         n_graph = attn_bias.size(0)
@@ -442,9 +454,13 @@ class GraphAttnBias(nn.Module):
 
             spatial_pos_bias = self.spatial_pos_encoder(spatial_pos)
             spatial_pos_bias = spatial_pos_bias.permute(0, 3, 1, 2)
+            spatial_pos_bias = spatial_pos_bias * self.a1_a3_scale
             graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + spatial_pos_bias
 
-            t = self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
+            t = (
+                self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
+                * self.a1_a3_scale
+            )
             graph_attn_bias[:, :, 1:, 0] = graph_attn_bias[:, :, 1:, 0] + t
             graph_attn_bias[:, :, 0, :] = graph_attn_bias[:, :, 0, :] + t
 
@@ -471,7 +487,7 @@ class GraphAttnBias(nn.Module):
 
             # Reduce edge_input
             max_dist = self.multi_hop_max_dist
-            edge_pos = torch.where(edge_padding_mask == False)  # edge_padding_mask [batch_size, max_edges_num]
+            edge_pos = torch.where(~edge_padding_mask)  # edge_padding_mask [batch_size, max_edges_num]
 
             # Adjust the dimensions and perform curv_encode.
             edge_data = edge_data.permute(0, 2, 1)
@@ -629,6 +645,7 @@ class GraphAttnBias(nn.Module):
             # 各个edge上的特征求和取均值
             edge_bias = (edge_bias.sum(-2) / (spatial_pos_.float().unsqueeze(-1))) # edge_input[n_graph, max_node_num, max_node_num, n_head]
             edge_bias = edge_bias.permute(0, 3, 1, 2)
+            edge_bias = edge_bias * self.a1_a3_scale
             graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + edge_bias
         # edge_feature 边编码------------------------------------------------------------------------------------------------------------
 

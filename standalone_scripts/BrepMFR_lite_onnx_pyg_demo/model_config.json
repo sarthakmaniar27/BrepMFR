@@ -1,0 +1,56 @@
+{
+  "num_classes": 3,
+  "uv_grid_u": 5,
+  "uv_grid_v": 5,
+  "uv_channels": 7,
+  "edge_grid_size": 5,
+  "edge_channels": 7,
+  "inference_profile": "lite",
+  "output_name": "logits",
+  "output_semantics": "softmax_probabilities",
+  "checkpoint": {
+    "path": "results/model_to_onnx/last.ckpt",
+    "run_name": "thread_text_53k_good_balance",
+    "dataset_path": "Z:\\thread_and_text\\lite",
+    "pt_subdir": "pyg",
+    "epoch": 64,
+    "global_step": 552500
+  },
+  "model_hyperparams": {
+    "dim_node": 256,
+    "d_model": 512,
+    "n_heads": 32,
+    "n_layers_encode": 8
+  },
+  "onnx_inputs": {
+    "node_data": {"shape": ["total_nodes", 5, 5, 7], "dtype": "float32"},
+    "face_area": {"shape": ["total_nodes"], "dtype": "float32"},
+    "face_type": {"shape": ["total_nodes"], "dtype": "int64"},
+    "face_loop": {"shape": ["total_nodes"], "dtype": "int64"},
+    "in_degree": {"shape": ["total_nodes"], "dtype": "int64"},
+    "attn_bias": {"shape": [1, "num_nodes_plus_one", "num_nodes_plus_one"], "dtype": "float32", "note": "zeros for lite"},
+    "padding_mask": {"shape": [1, "num_nodes"], "dtype": "bool", "note": "False=real face"}
+  },
+  "onnx_inputs_optimized_out": [
+    "edge_data",
+    "edge_type",
+    "edge_len",
+    "edge_ang",
+    "edge_conv",
+    "edge_index",
+    "edge_padding_mask"
+  ],
+  "input_dtype_policy": {
+    "float_inputs": "float32",
+    "index_inputs": "int64",
+    "note": "Cast face_type/face_loop/in_degree to int64 before ORT; .pt files may store int32"
+  },
+  "parity_validation": {
+    "dataset": "Z:\\thread_and_text\\lite",
+    "graphs_tested": 10,
+    "faces_tested": 1080,
+    "label_match": "1080/1080",
+    "max_abs_diff": 2.38e-06,
+    "result": "PASS"
+  }
+}

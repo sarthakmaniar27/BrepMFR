@@ -1,0 +1,3 @@
+graph,prediction_csv,faces,mean_confidence,class_counts,status,error
+\\Gr-sw66464\D\thread_and_text\lite\pyg\00000000_both_v4_105.pt,C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\migration_to_c\test_onnx_folder_output\00000000_both_v4_105_predictions.csv,589,0.96758290,"Stock=147, Thread=282, Text=160",PASS,
+\\Gr-sw66464\D\thread_and_text\lite\pyg\00000000_both_v5_105.pt,C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\migration_to_c\test_onnx_folder_output\00000000_both_v5_105_predictions.csv,262,0.97718894,"Stock=19, Thread=41, Text=202",PASS,

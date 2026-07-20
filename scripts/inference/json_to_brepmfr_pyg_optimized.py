@@ -24,8 +24,10 @@ like **post-``append_angle``** graphs. You do **not** run ``append_angle_7th_cha
   (smallest ``.pt`` + fastest JSON ingest). Collator synthesizes ``attn_bias`` for attention.
 
 **Speed:** ``no_a2`` and ``full`` still run **all-pairs shortest paths** (A1); omitting A2 does not
-remove that cost. Use ``lite`` to skip A1 entirely, and/or ``--shortest_path_workers N`` (``N>1``)
-to parallelize BFS over source nodes on large graphs.
+remove that cost. The serial BFS uses NumPy buffers (far faster than per-cell torch writes). Prefer
+file-level parallelism via ``scripts/threads/upgrade_lite_pt_to_no_a2.py`` when upgrading an existing
+lite corpus. ``--shortest_path_workers N`` (``N>1``) only helps single huge graphs (N≥512) and is
+expensive to spawn repeatedly on Windows — keep it at 0 for bulk conversion.
 
 ``--skip_a2`` is kept as a **deprecated** alias for ``--inference_profile no_a2``.
 
@@ -44,6 +46,7 @@ Example:
   conda activate brep_mfr_pyg
   python scripts/inference/json_to_brepmfr_pyg_optimized.py \\
     --json_dir Z:/Experiment_test/input_json \\
+    --abc_json_dir Z:/Experiment_test/abc_jsons \\
     --pt_out_dir Z:/Experiment_test/out_pyg \\
     --label_out_dir Z:/Experiment_test/out_label \\
     --inference_profile no_a2 --profile
@@ -76,6 +79,15 @@ try:
     import orjson as _orjson  # type: ignore[assignment]
 except ImportError:
     _orjson = None
+
+# Try to import compiled BFS kernel (built via scripts/inference/build_bfs.py).
+try:
+    from _bfs_kernel import all_pairs_bfs as _bfs_cython
+
+    _HAS_CYTHON_BFS = True
+except ImportError:
+    _bfs_cython = None  # type: ignore[assignment,misc]
+    _HAS_CYTHON_BFS = False
 
 InferenceProfile = Literal["full", "no_a2", "lite"]
 
@@ -145,6 +157,25 @@ def _directed_adj_with_edge_ids(src_nodes, dst_nodes, num_nodes: int) -> list[li
     return adj
 
 
+def _adj_to_csr(src_nodes, dst_nodes, num_nodes: int):
+    """Directed arc lists → CSR ``(offsets, targets, edge_ids)`` for the Cython BFS kernel."""
+    src = np.asarray(src_nodes, dtype=np.int32)
+    dst = np.asarray(dst_nodes, dtype=np.int32)
+    nnz = src.size
+    if nnz == 0:
+        offsets = np.zeros(num_nodes + 1, dtype=np.int32)
+        empty = np.empty(0, dtype=np.int32)
+        return offsets, empty, empty
+    # Stable sort by source preserves the same neighbour iteration order as
+    # _directed_adj_with_edge_ids, so BFS breaks ties identically.
+    order = np.argsort(src, kind="stable").astype(np.int32)
+    tgt = dst[order]
+    counts = np.bincount(src, minlength=num_nodes)
+    offsets = np.zeros(num_nodes + 1, dtype=np.int32)
+    offsets[1:] = np.cumsum(counts)
+    return offsets, tgt, order  # order[j] = original arc index = edge ID
+
+
 def _shortest_paths_from_adj_serial_legacy(adj: list[list[tuple[int, int]]], num_nodes: int, max_dist: int):
     """
     Legacy A1 + A3: BFS then per-target backtrack (reference for bit-identical checks).
@@ -191,19 +222,28 @@ def _shortest_paths_from_adj_serial_legacy(adj: list[list[tuple[int, int]]], num
 
 def _shortest_paths_from_adj_serial(adj: list[list[tuple[int, int]]], num_nodes: int, max_dist: int):
     """
-    A1 + edge_path (Graphormer-style). Prefix accumulation during BFS — same outputs as legacy
-    on the same BFS tree (first-discovery unweighted BFS).
+    A1 + edge_path via parent-backtrack BFS (Graphormer-style).
+
+    Instead of copying a ``max_dist``-element numpy row on every BFS edge
+    traversal (the old prefix approach), this stores only ``parent_node`` /
+    ``parent_edge`` during BFS (2 int writes per edge) and backtracks after
+    BFS completes.  Same result, far fewer memory copies on large graphs.
     """
-    spatial_pos = torch.full((num_nodes, num_nodes), fill_value=10**9, dtype=torch.int32)
-    edges_path = torch.full((num_nodes, num_nodes, max_dist), fill_value=-1, dtype=torch.int32)
+    spatial_pos = np.full((num_nodes, num_nodes), 10**9, dtype=np.int32)
+    edges_path = np.full((num_nodes, num_nodes, max_dist), -1, dtype=np.int32)
+
+    # Reusable buffers across all sources (no per-source allocation).
+    parent_node = [0] * num_nodes
+    parent_edge = [0] * num_nodes
+    path_buf = [0] * num_nodes  # max path length = num_nodes - 1
 
     for s in range(num_nodes):
-        spatial_pos[s, s] = 0
         dist = [-1] * num_nodes
-        path_prefix: list[list[int]] = [[-1] * max_dist for _ in range(num_nodes)]
-        q = deque([s])
         dist[s] = 0
+        spatial_pos[s, s] = 0
+        q = deque([s])
 
+        # BFS: store parent pointers only (no row copies).
         while q:
             u = q.popleft()
             du = dist[u]
@@ -211,21 +251,31 @@ def _shortest_paths_from_adj_serial(adj: list[list[tuple[int, int]]], num_nodes:
                 if dist[v] != -1:
                     continue
                 dist[v] = du + 1
-                path_prefix[v] = path_prefix[u][:]
-                if du < max_dist:
-                    path_prefix[v][du] = ei
+                parent_node[v] = u
+                parent_edge[v] = ei
                 q.append(v)
 
+        # Backtrack from each reachable target to reconstruct edge paths.
         for t in range(num_nodes):
-            if dist[t] == -1:
+            d = dist[t]
+            if d <= 0:
                 continue
-            spatial_pos[s, t] = dist[t]
-            if t == s:
-                continue
-            for k in range(max_dist):
-                edges_path[s, t, k] = int(path_prefix[t][k])
+            spatial_pos[s, t] = d
 
-    return spatial_pos, edges_path
+            # Walk t → s, collecting edges in reverse.
+            cur = t
+            plen = 0
+            while cur != s:
+                path_buf[plen] = parent_edge[cur]
+                cur = parent_node[cur]
+                plen += 1
+
+            # Copy first min(plen, max_dist) edges, reversed, into result.
+            k = plen if plen < max_dist else max_dist
+            for j in range(k):
+                edges_path[s, t, j] = path_buf[plen - 1 - j]
+
+    return torch.from_numpy(spatial_pos), torch.from_numpy(edges_path)
 
 
 # ProcessPool workers (spawn on Windows): adj + max_dist set once per pool.
@@ -316,15 +366,26 @@ def _compute_shortest_paths_edge_indices(
     """
     Computes A1 (Shortest path distance) and A3 (Chain of edge indices).
     Matches Graphormer-style encoding where edges_path stores the sequence of edge IDs.
+
+    Prefer serial NumPy BFS for normal graphs. Per-source ``ProcessPool`` only helps on very
+    large single graphs (N>=512) and is costly to spawn repeatedly on Windows — for corpus
+    conversion, use file-level workers in ``upgrade_lite_pt_to_no_a2.py`` instead.
     """
+    if legacy_bfs:
+        adj = _directed_adj_with_edge_ids(src_nodes, dst_nodes, num_nodes)
+        return _shortest_paths_from_adj_serial_legacy(adj, num_nodes, max_dist)
+    # Compiled Cython kernel (fastest): CSR adjacency → C-level BFS + backtrack.
+    if _HAS_CYTHON_BFS and num_workers <= 1:
+        offsets, tgt, eid = _adj_to_csr(src_nodes, dst_nodes, num_nodes)
+        sp, ep = _bfs_cython(offsets, tgt, eid, num_nodes, max_dist)
+        return torch.from_numpy(sp), torch.from_numpy(ep)
+    # Python fallback with parent-backtrack BFS.
     adj = _directed_adj_with_edge_ids(src_nodes, dst_nodes, num_nodes)
     use_parallel = (
         num_workers > 1
-        and num_nodes >= 64
+        and num_nodes >= 512
         and (os.cpu_count() or 1) >= 2
     )
-    if legacy_bfs:
-        return _shortest_paths_from_adj_serial_legacy(adj, num_nodes, max_dist)
     if use_parallel:
         return _shortest_paths_from_adj_parallel(adj, num_nodes, max_dist, num_workers)
     return _shortest_paths_from_adj_serial(adj, num_nodes, max_dist)
@@ -1240,6 +1301,12 @@ def main():
         )
     )
     parser.add_argument("--json_dir", type=str, default=None, help="Input folder containing per-model *.json")
+    parser.add_argument(
+        "--abc_json_dir",
+        type=str,
+        default=None,
+        help="Optional second JSON folder (e.g. abc_jsons). Converted into the same --pt_out_dir / --label_out_dir.",
+    )
     parser.add_argument("--pt_out_dir", type=str, default=None, help="Output folder for ``.pt`` graphs")
     parser.add_argument("--label_out_dir", type=str, default=None)
     parser.add_argument("--spatial_pos_max", type=int, default=32)
@@ -1474,7 +1541,26 @@ def main():
     label_out_dir = Path(args.label_out_dir) if args.label_out_dir else None
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
 
-    json_files = sorted(json_dir.glob("*.json"))
+    # Primary folder + optional ABC / extra folder → same .pt / label outputs
+    json_files: list[Path] = sorted(json_dir.glob("*.json"))
+    abc_stems: list[str] = []
+    if args.abc_json_dir:
+        abc_dir = Path(args.abc_json_dir)
+        if not abc_dir.is_dir():
+            parser.error(f"--abc_json_dir is not a directory: {abc_dir}")
+        abc_files = sorted(abc_dir.glob("*.json"))
+        abc_stems = [p.stem for p in abc_files]
+        primary_names = {p.name for p in json_files}
+        overlap = [p.name for p in abc_files if p.name in primary_names]
+        if overlap:
+            print(
+                f"[WARN] {len(overlap)} filename(s) exist in both --json_dir and --abc_json_dir; "
+                "ABC copy will overwrite / skip the same stem. First overlap: "
+                + ", ".join(overlap[:5])
+            )
+        json_files = sorted(json_files + abc_files, key=lambda p: p.name.lower())
+        print(f"Primary JSON: {len(list(json_dir.glob('*.json')))} | ABC JSON: {len(abc_files)} | Combined: {len(json_files)}")
+
     ok = 0
     skipped = 0
     failed = 0
@@ -1523,6 +1609,12 @@ def main():
         max_ms = max(conversion_times) * 1000
         print(f"Per-file conversion time — avg: {avg_ms:.1f} ms | min: {min_ms:.1f} ms | max: {max_ms:.1f} ms")
     print(f"Total wall-clock time: {wall_total:.1f} s ({wall_total/60:.2f} min)")
+
+    # Manifest for make_random_splits.py --abc-json-dir (stems that came from ABC folder)
+    if abc_stems:
+        manifest = pt_out_dir.parent / "abc_stems.txt"
+        manifest.write_text("\n".join(abc_stems) + ("\n" if abc_stems else ""), encoding="utf-8")
+        print(f"Wrote ABC stem manifest: {manifest}  ({len(abc_stems):,} stems)")
 
 
 if __name__ == "__main__":

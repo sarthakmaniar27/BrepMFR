@@ -63,6 +63,7 @@ from data.collator import collator  # noqa: E402
 THREAD_FACE_LABEL_NAME: Dict[int, str] = {
     0: "stock",
     1: "thread",
+    2: "text",
 }
 
 DEFAULT_CHECKPOINT = (

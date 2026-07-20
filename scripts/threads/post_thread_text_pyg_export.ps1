@@ -1,5 +1,5 @@
 # Run AFTER json_to_brepmfr_pyg_optimized.py has finished (all .pt present).
-# Thread + text (3-class): splits, class weights, label recount.
+# Thread + text (3-class): STEP-aware splits, class weights, label recount.
 # Uses conda env brep_mfr_pyg. Adjust paths if needed.
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +10,7 @@ if (-not (Test-Path (Join-Path $Repo "segmentation.py"))) {
 Set-Location $Repo
 
 $JsonDir = "\\Gr-sw66464\d\thread_and_text\thread_text_merged"
+$AbcJsonDir = "D:\thread_and_text\abc_jsons"   # set to $null to skip ABC train quota
 $PygDir = "E:\thread_text_merged\pyg"
 $LabelDir = "E:\thread_text_merged\label"
 # Split lists (train/val/test.txt) live next to the pyg folder (e.g. .../lite/), not inside pyg/
@@ -25,7 +26,21 @@ if ($nPyg -lt $nJson) {
     exit 1
 }
 
-conda run -n brep_mfr python scripts/threads/make_random_splits.py --pyg-dir $PygDir --out-dir $DataRoot --seed 42
+$splitArgs = @(
+    "scripts/threads/make_random_splits.py",
+    "--pyg-dir", $PygDir,
+    "--out-dir", $DataRoot,
+    "--seed", "42",
+    "--abc-min-train-frac", "0.8"
+)
+if ($AbcJsonDir -and (Test-Path $AbcJsonDir)) {
+    $splitArgs += @("--abc-json-dir", $AbcJsonDir)
+    Write-Host "STEP-aware split with ABC train quota (>=80%) from: $AbcJsonDir"
+} else {
+    Write-Host "STEP-aware split (no --abc-json-dir)"
+}
+
+conda run -n brep_mfr python @splitArgs
 
 New-Item -ItemType Directory -Force -Path "artifacts/class_weights/thread_text" | Out-Null
 conda run -n brep_mfr python scripts/training/compute_class_weights.py `

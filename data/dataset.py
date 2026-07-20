@@ -160,6 +160,7 @@ class CADSynth(Dataset):
         num_class=33,
         pt_subdir=None,
         max_graph_nodes: Optional[int] = None,
+        max_nodes_for_a3: Optional[int] = None,
         drop_invalid_graphs: bool = False,
         *,
         # ------------------------------------------------------------------
@@ -178,6 +179,8 @@ class CADSynth(Dataset):
         self.random_rotate = random_rotate
         self.pt_subdir = pt_subdir
         self.max_graph_nodes = max_graph_nodes
+        self.max_nodes_for_a3 = max_nodes_for_a3
+        self._warned_a3_collate_cap = False
         self.drop_invalid_graphs = bool(drop_invalid_graphs)
 
         # Subgraph sampling configuration (ignored when subgraph_training=False)
@@ -316,10 +319,24 @@ class CADSynth(Dataset):
         return sample
 
     def _collate(self, batch):
+        max_nodes = max(int(item.node_data.size(0)) for item in batch)
+        if (
+            self.max_nodes_for_a3 is not None
+            and max_nodes > int(self.max_nodes_for_a3)
+            and not self._warned_a3_collate_cap
+        ):
+            print(
+                "CADSynth collator: skipping dense A3 for a batch with "
+                f"{max_nodes} padded faces (> max_nodes_for_a3={self.max_nodes_for_a3}); "
+                "A1 remains enabled.",
+                flush=True,
+            )
+            self._warned_a3_collate_cap = True
         return collator(
             batch,
             multi_hop_max_dist=16,
             spatial_pos_max=32,
+            max_nodes_for_a3=self.max_nodes_for_a3,
         )
 
     def get_dataloader(

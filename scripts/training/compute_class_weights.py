@@ -71,7 +71,7 @@ from data.dataset import _resolve_dataset_split_list
 class _LabelOnlyDataset(Dataset):
     """Loads only .label_feature from each .pt — no graph attention overhead."""
 
-    def __init__(self, root: str, filelist: str):
+    def __init__(self, root: str, filelist: str, skip_bad: bool = False):
         path = pathlib.Path(root)
         list_path = _resolve_dataset_split_list(path, filelist)
         with open(list_path, "r", encoding="utf-8") as f:
@@ -80,6 +80,8 @@ class _LabelOnlyDataset(Dataset):
         if not self.paths:
             raise RuntimeError(f"No samples matched '{filelist}' under {path}")
         print(f"[{filelist}] resolved {list_path} -> {len(self.paths):,} files")
+        self.skip_bad = skip_bad
+        self.bad_count = 0
 
     def __len__(self):
         return len(self.paths)
@@ -88,12 +90,24 @@ class _LabelOnlyDataset(Dataset):
         # We still pay the cost of torch.load() for the whole PyGGraph because
         # the .pt files are not partial-loadable. We just discard everything
         # except the labels in the collator.
-        g = torch.load(self.paths[idx], map_location="cpu", weights_only=False)
-        return g.label_feature.long()
+        path = self.paths[idx]
+        try:
+            g = torch.load(path, map_location="cpu", weights_only=False)
+            return g.label_feature.long()
+        except Exception as e:
+            if not self.skip_bad:
+                raise
+            self.bad_count += 1
+            if self.bad_count <= 20:
+                print(f"[skip-bad] {path.name}: {e}")
+            return torch.empty(0, dtype=torch.long)
 
 
 def _collate_labels(batch):
-    return torch.cat([t.flatten() for t in batch], dim=0)
+    parts = [t.flatten() for t in batch if t.numel() > 0]
+    if not parts:
+        return torch.empty(0, dtype=torch.long)
+    return torch.cat(parts, dim=0)
 
 
 def main():
@@ -115,12 +129,17 @@ def main():
         help="If >0, sample only this many files (smoke-test or quick estimate).",
     )
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--skip-bad",
+        action="store_true",
+        help="Skip corrupt/unreadable .pt files instead of aborting.",
+    )
     args = parser.parse_args()
 
     out_path = pathlib.Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ds = _LabelOnlyDataset(args.dataset_path, args.split + ".txt")
+    ds = _LabelOnlyDataset(args.dataset_path, args.split + ".txt", skip_bad=args.skip_bad)
     if args.max_files > 0 and args.max_files < len(ds.paths):
         # Deterministic subsample (first N) for reproducibility — fine for
         # smoke tests where we only need a non-zero count vector to flow through.
@@ -141,9 +160,14 @@ def main():
 
     counts = np.zeros(args.num_classes, dtype=np.int64)
     for labels in tqdm(loader, desc="counting", dynamic_ncols=True):
+        if labels.numel() == 0:
+            continue
         labels_np = labels.numpy()
         labels_np = labels_np[(labels_np >= 0) & (labels_np < args.num_classes)]
         counts += np.bincount(labels_np, minlength=args.num_classes)
+
+    if args.skip_bad and ds.bad_count:
+        print(f"\nSkipped corrupt/unreadable .pt files: {ds.bad_count:,}")
 
     total = int(counts.sum())
     print(f"\nTotal labelled faces: {total:,}")

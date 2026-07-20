@@ -198,6 +198,14 @@ class BrepSeg(pl.LightningModule):
 
         # Optional: freeze encoder for first few epochs when fine-tuning
         self.warmup_freeze_epochs = getattr(args, "warmup_freeze_epochs", 0)
+        self.learning_rate = float(getattr(args, "learning_rate", 0.002))
+        raw_a1_a3_lr = getattr(args, "a1_a3_learning_rate", None)
+        self.a1_a3_learning_rate = (
+            self.learning_rate if raw_a1_a3_lr is None else float(raw_a1_a3_lr)
+        )
+        self.optimizer_warmup_steps = int(getattr(args, "optimizer_warmup_steps", 5000))
+        self.a1_a3_ramp_epochs = int(getattr(args, "a1_a3_ramp_epochs", 0))
+        self.a1_a3_start_scale = float(getattr(args, "a1_a3_start_scale", 0.1))
 
         # ---------------------------------------------------------
         # Loss function selection
@@ -328,8 +336,52 @@ class BrepSeg(pl.LightningModule):
                 for p in self.brep_encoder.parameters():
                     p.requires_grad = False
 
+        # A lite checkpoint contains the A1/A3 modules but they never received
+        # gradients. Start their additive attention contribution gently, then
+        # increase it at each epoch boundary.
+        initial_a1_a3_scale = (
+            self.a1_a3_start_scale if self.a1_a3_ramp_epochs > 0 else 1.0
+        )
+        self.brep_encoder.graph_attn_bias.set_a1_a3_scale(initial_a1_a3_scale)
+        if self.a1_a3_ramp_epochs > 0:
+            print(
+                "A1/A3 gradual activation: "
+                f"start_scale={initial_a1_a3_scale:.3f}, "
+                f"ramp_epochs={self.a1_a3_ramp_epochs}"
+            )
+
+    def _a1_a3_scale_for_epoch(self, epoch: int) -> float:
+        if self.a1_a3_ramp_epochs <= 0:
+            return 1.0
+        if self.a1_a3_ramp_epochs == 1:
+            return 1.0
+        progress = min(1.0, max(0.0, float(epoch) / float(self.a1_a3_ramp_epochs - 1)))
+        return self.a1_a3_start_scale + (1.0 - self.a1_a3_start_scale) * progress
+
+    def on_load_checkpoint(self, checkpoint):
+        """Allow checkpoints created before the persistent A1/A3 scale buffer."""
+        key = "brep_encoder.graph_attn_bias.a1_a3_scale"
+        state_dict = checkpoint.get("state_dict", {})
+        if key not in state_dict:
+            state_dict[key] = self.brep_encoder.graph_attn_bias.a1_a3_scale.detach().clone()
+
     # Gradually unfreeze encoder after warmup_freeze_epochs
     def on_train_epoch_start(self):
+        a1_a3_scale = self._a1_a3_scale_for_epoch(int(self.current_epoch))
+        self.brep_encoder.graph_attn_bias.set_a1_a3_scale(a1_a3_scale)
+        self.log(
+            "a1_a3_scale",
+            a1_a3_scale,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=True,
+        )
+        if self.a1_a3_ramp_epochs > 0:
+            print(
+                f"A1/A3 scale at epoch {self.current_epoch}: {a1_a3_scale:.3f}",
+                flush=True,
+            )
         if self.warmup_freeze_epochs > 0 and self.current_epoch == self.warmup_freeze_epochs:
             print(f"Unfreezing brep_encoder at epoch {self.current_epoch}")
             for p in self.brep_encoder.parameters():
@@ -392,6 +444,13 @@ class BrepSeg(pl.LightningModule):
             opt = opt[0]
         current_lr = opt.param_groups[0]["lr"]
         self.log("current_lr", current_lr, on_step=False, on_epoch=True)
+        if len(opt.param_groups) > 1:
+            self.log(
+                "a1_a3_lr",
+                opt.param_groups[1]["lr"],
+                on_step=False,
+                on_epoch=True,
+            )
 
 
     def validation_step(self, batch, batch_idx):
@@ -584,22 +643,64 @@ class BrepSeg(pl.LightningModule):
         self.pred = []
         self.label = []
 
+        # Friendly names for the common 2/3-class thread(+text) setups; else class_i
+        _default_names = {0: "Stock", 1: "Thread", 2: "Text"}
+
+        def _class_name(i: int) -> str:
+            return _default_names.get(i, f"class_{i}")
+
         per_face_comp = (preds_np == labels_np).astype(np.int64)
         self.log("per_face_accuracy", np.mean(per_face_comp))
         print("per_face_accuracy: %s" % np.mean(per_face_comp))
 
-        # pre-class acc-----------------------------------------------------------------------------
+        # Per-class accuracy / precision / recall (one entry per training class)
         per_class_acc = []
-        for i in range (0, self.num_classes):
-            class_pos = np.where(labels_np == i)
-            if len(class_pos[0]) > 0:
-                class_i_preds = preds_np[class_pos]
-                class_i_label = labels_np[class_pos]
-                per_face_comp = (class_i_preds == class_i_label).astype(np.int64)
-                per_class_acc.append(np.mean(per_face_comp))
-                print("class_%s_acc: %s" % (i+1, np.mean(per_face_comp)))
-        self.log("per_class_accuracy", np.mean(per_class_acc))
-        print("per_class_accuracy: %s" % np.mean(per_class_acc))
+        per_class_precision = []
+        per_class_recall = []
+        print("\nPer-class precision / recall / accuracy:")
+        print(f"  {'class':<10} {'precision':>10} {'recall':>10} {'accuracy':>10} {'support':>10} {'pred_n':>10}")
+        for i in range(0, self.num_classes):
+            name = _class_name(i)
+            label_pos = np.where(labels_np == i)[0]
+            pred_pos = np.where(preds_np == i)[0]
+            support = int(len(label_pos))
+            pred_n = int(len(pred_pos))
+            tp = int(np.sum(preds_np[label_pos] == i)) if support > 0 else 0
+
+            # Recall = TP / (TP+FN) = TP / support  (same as per-class accuracy)
+            recall = float(tp / support) if support > 0 else 0.0
+            # Precision = TP / (TP+FP) = TP / pred_n
+            precision = float(tp / pred_n) if pred_n > 0 else 0.0
+            acc = recall  # face-level class accuracy ≡ recall
+
+            per_class_acc.append(acc)
+            per_class_precision.append(precision)
+            per_class_recall.append(recall)
+
+            self.log(f"test_class_{i}_acc", acc)
+            self.log(f"test_class_{i}_precision", precision)
+            self.log(f"test_class_{i}_recall", recall)
+            # Named aliases for Stock / Thread / Text when applicable
+            if i in _default_names:
+                self.log(f"test_{name}_precision", precision)
+                self.log(f"test_{name}_recall", recall)
+                self.log(f"test_{name}_acc", acc)
+
+            print(
+                f"  {name:<10} {precision:10.4f} {recall:10.4f} {acc:10.4f} "
+                f"{support:10d} {pred_n:10d}"
+            )
+
+        if per_class_acc:
+            macro_acc = float(np.mean(per_class_acc))
+            macro_p = float(np.mean(per_class_precision))
+            macro_r = float(np.mean(per_class_recall))
+            self.log("per_class_accuracy", macro_acc)
+            self.log("macro_precision", macro_p)
+            self.log("macro_recall", macro_r)
+            print("per_class_accuracy (macro): %s" % macro_acc)
+            print("macro_precision: %s" % macro_p)
+            print("macro_recall: %s" % macro_r)
 
         # IoU---------------------------------------------------------------------------------------
         per_class_iou = []
@@ -677,12 +778,41 @@ class BrepSeg(pl.LightningModule):
     #         }
 
     def configure_optimizers(self):
+        a1_a3_params = []
+        base_params = []
+        for name, parameter in self.named_parameters():
+            if name.startswith("brep_encoder.graph_attn_bias."):
+                a1_a3_params.append(parameter)
+            else:
+                base_params.append(parameter)
+
+        parameter_groups = [
+            {
+                "params": base_params,
+                "lr": self.learning_rate,
+                "target_lr": self.learning_rate,
+                "name": "pretrained_backbone",
+            },
+            {
+                "params": a1_a3_params,
+                "lr": self.a1_a3_learning_rate,
+                "target_lr": self.a1_a3_learning_rate,
+                "name": "a1_a3_bias",
+            },
+        ]
         optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=0.002,
+            parameter_groups,
+            lr=self.learning_rate,
             betas=(0.9, 0.999),
             eps=1e-8,
             weight_decay=0.01,
+        )
+        print(
+            "Optimizer learning rates: "
+            f"backbone={self.learning_rate:g}, "
+            f"A1/A3={self.a1_a3_learning_rate:g}, "
+            f"warmup_steps={self.optimizer_warmup_steps}",
+            flush=True,
         )
 
         # Monitor per_class_accuracy (macro-averaged, computed in
@@ -714,10 +844,17 @@ class BrepSeg(pl.LightningModule):
         }
 
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure=None, **kwargs):
-        optimizer.step(closure=optimizer_closure)
-
-        # Warmup: linearly ramp LR from 0 → 0.002 over first 5000 steps
-        if self.trainer.global_step < 5000:
-            lr_scale = min(1.0, float(self.trainer.global_step + 1) / 5000.0)
+        # Set warmup rates before optimizer.step so the first update is not
+        # accidentally taken at the full target LR. Each parameter group keeps
+        # its own target, which is important for lite -> A1/A3 fine-tuning.
+        if (
+            self.optimizer_warmup_steps > 0
+            and self.trainer.global_step < self.optimizer_warmup_steps
+        ):
+            lr_scale = min(
+                1.0,
+                float(self.trainer.global_step + 1) / float(self.optimizer_warmup_steps),
+            )
             for pg in optimizer.param_groups:
-                pg["lr"] = lr_scale * 0.002
+                pg["lr"] = lr_scale * float(pg.get("target_lr", self.learning_rate))
+        optimizer.step(closure=optimizer_closure)
