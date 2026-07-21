@@ -252,6 +252,129 @@ conda run -n brep_mfr_pyg python segmentation.py test `
 
 Compare this result with the preserved lite checkpoint on the lite test set. Keep the A1+A3 model only if per-class precision/recall and macro metrics improve; adding structural bias is useful context, not a guaranteed improvement.
 
+## 7. Add new raw JSONs to an existing no_a2 dataset, then train from scratch
+
+Use this path when `no_a2/pyg` already contains older graphs but `root_json` and/or the ABC JSON folder contain additional raw-label JSONs with no lite `.pt` equivalent.
+
+The delta script checks both source folders and selects JSONs whose stems do not yet exist in the target PyG directory. Existing JSONs and existing no_a2 graphs are not rewritten. Label audit/remap uses up to eight persistent worker processes plus `orjson` when installed.
+
+### 7.1 Strict dry run
+
+```powershell
+cd C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG
+powershell -ExecutionPolicy Bypass -File scripts/threads/prepare_no_a2_scratch_delta.ps1 `
+  -JsonDir D:\thread_and_text\root_json `
+  -BaseNoA2Root D:\thread_and_text\no_a2 `
+  -OutputRoot D:\thread_and_text\no_a2_large `
+  -AbcJsonDir D:\thread_and_text\abc_json
+```
+
+This audits only missing JSONs and stops without writing. Unknown labels cause failure and must be added deliberately to the remap file. The original `no_a2` directory is read-only in this workflow.
+
+### 7.2 Apply remap and prepare the complete dataset
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/threads/prepare_no_a2_scratch_delta.ps1 `
+  -JsonDir D:\thread_and_text\root_json `
+  -BaseNoA2Root D:\thread_and_text\no_a2 `
+  -OutputRoot D:\thread_and_text\no_a2_large `
+  -AbcJsonDir D:\thread_and_text\abc_json `
+  -ApplyLabelRemap
+```
+
+The script performs the full required sequence:
+
+1. Hard-links existing `.pt` files from `no_a2/pyg` into `no_a2_large/pyg` without duplicating their bytes.
+2. Strictly audits and parallel-remaps missing root and ABC JSONs.
+3. Runs root+ABC JSON→`no_a2_large` conversion without `--label_out_dir`, so seeded `.pt` files are skipped.
+4. Confirms every root and ABC JSON has a graph in the expanded directory.
+5. Backs up old expanded-dataset split lists, then regenerates STEP-aware splits across the complete corpus.
+6. Recomputes class weights into `artifacts/class_weights/thread_text/no_a2_large_70k_train_alpha05.json`.
+7. Validates A1/A3 flags and tensors across the new splits.
+
+`-SeedMode HardLink` is the default because copying the dense A1/A3 corpus can fill the drive. The workflow treats seeded graphs as immutable, so the protected base remains unchanged. Use `-SeedMode Copy` only with sufficient free space. Conversion refuses to start below `-MinFreeGB 20`.
+
+If an earlier copy-based attempt filled the disk and left `no_a2_large` partial, stop it and restart with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/threads/prepare_no_a2_scratch_delta.ps1 `
+  -JsonDir D:\thread_and_text\root_json `
+  -BaseNoA2Root D:\thread_and_text\no_a2 `
+  -OutputRoot D:\thread_and_text\no_a2_large `
+  -AbcJsonDir D:\thread_and_text\abc_json `
+  -ApplyLabelRemap `
+  -ResetOutput `
+  -SeedMode HardLink `
+  -RemapWorkers 8
+```
+
+`-ResetOutput` deletes only the partial `no_a2_large`; it is refused if output and base paths are identical.
+
+The final full validator automatically quarantines unusable graphs (for example, legacy `.pt` files with an empty `label_feature`) under `no_a2_large/quarantine_invalid_graphs`, removes their stems from `train.txt`, `val.txt`, `test.txt`, and `abc_stems.txt`, and writes `report.json`. It scans the complete split instead of stopping after the first 20 errors.
+
+If conversion, splitting, and class-weight calculation already completed before validation found bad graphs, do **not** rerun preparation. Recover in place with:
+
+```powershell
+conda run --no-capture-output -n brep_mfr_pyg python `
+  scripts/threads/validate_a1_a3_finetune_data.py `
+  --dataset-root D:\thread_and_text\no_a2_large `
+  --report-a3-cap 768 `
+  --quarantine-invalid
+```
+
+### 7.3 Start a completely new run
+
+If preparation and training are launched from different repository checkouts, synchronize the coordinated model/data files first. This creates a timestamped backup in the target checkout and verifies all copied Python files:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/threads/sync_a1_a3_training_code.ps1 `
+  -TargetRepo C:\Users\RZA2\Desktop\BrepMFR\brepmfr_pyg\BrepMFR
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/threads/train_no_a2_from_scratch.ps1 `
+  -DatasetRoot D:\thread_and_text\no_a2_large `
+  -MaxEpochs 100 `
+  -MaxNodesForA3 768 `
+  -BatchSize 64 `
+  -BatchNodeSqBudget 4000000 `
+  -DataLoaderWorkers 4 `
+  -PrefetchFactor 2
+```
+
+This command intentionally supplies neither `--pre_train` nor `--resume_from_checkpoint`. A1/A3 are fully active from epoch 0 and use the same `0.002` learning rate as the rest of the randomly initialized model.
+
+The optimized sampler sorts graphs by actual face count and packs each batch while
+`batch_graphs × padded_faces² <= 4,000,000`, capped at 64 graphs. It keeps graphs
+above/below the A3 cap in separate batches, so a large graph cannot accidentally
+disable A3 for smaller graphs. This replaces the old `>300 faces -> batch size 1`
+rule that produced ~17,000 batches per epoch. Dense A1/A3 indices transfer as int32
+instead of int64, and encoder self-attention uses PyTorch fused SDPA while preserving
+the additive Graphormer bias. The wrapper also enables pinned host memory, TF32 for
+remaining float32 CUDA kernels, fused AdamW, stable logits-based
+losses, and on-device validation aggregation. It removes sanity-validation steps,
+uses one optimizer step per packed batch, and runs full validation every two epochs.
+
+Four persistent DataLoader workers prefetch into pinned host memory by default. On
+Windows, if this causes `ERROR_COMMITMENT_LIMIT (1455)`, excessive page-file use,
+or worker stalls, rerun with `-DataLoaderWorkers 0`; adaptive batching and fused
+attention remain active.
+
+On a 92 GB GPU, start with `-BatchNodeSqBudget 4000000`. If peak allocated memory
+stays comfortably below capacity, try `8000000`; if CUDA OOM occurs, use `2000000`.
+The budget changes packing and speed, not graph contents or A1/A3 semantics.
+
+If the run is interrupted, resume the exact optimizer/epoch state with the same run name:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/threads/train_no_a2_from_scratch.ps1 `
+  -DatasetRoot D:\thread_and_text\no_a2_large `
+  -RunName <the-original-run-name> `
+  -MaxEpochs 100 `
+  -MaxNodesForA3 768 `
+  -ResumeFromCheckpoint "results\stage1\<the-original-run-name>\last.ckpt"
+```
+
 ## Subgraph Training (k-hop neighborhoods) — Recommended for Severe Imbalance
 
 The biggest lever against "text walls drowning thread signals" is to stop training on whole graphs.

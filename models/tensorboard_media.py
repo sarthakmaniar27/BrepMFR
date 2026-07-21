@@ -53,27 +53,21 @@ def tb_add_scalar(trainer, tag: str, value: float, global_step: int) -> None:
         lg.experiment.add_scalar(tag, value, global_step)
 
 
-def confusion_matrix_figure_tensor(
-    preds: np.ndarray,
-    labels: np.ndarray,
-    num_classes: int,
+def confusion_matrix_counts_figure_tensor(
+    counts: np.ndarray,
     normalize_rows: bool = True,
 ) -> torch.Tensor:
-    """Build normalized confusion visualization as CHW float tensor [0,1]."""
+    """Render a pre-aggregated [true, predicted] confusion matrix."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    preds = preds.astype(np.int64).ravel()
-    labels = labels.astype(np.int64).ravel()
-    cm = np.zeros((num_classes, num_classes), dtype=np.float64)
-    for p, t in zip(preds, labels):
-        if 0 <= t < num_classes and 0 <= p < num_classes:
-            cm[t, p] += 1.0
+    cm = np.asarray(counts, dtype=np.float64)
+    if cm.ndim != 2 or cm.shape[0] != cm.shape[1]:
+        raise ValueError(f"Expected a square confusion matrix, got {cm.shape}")
     if normalize_rows:
-        row_sum = cm.sum(axis=1, keepdims=True)
-        row_sum = np.maximum(row_sum, 1e-9)
+        row_sum = np.maximum(cm.sum(axis=1, keepdims=True), 1e-9)
         cm = cm / row_sum
 
     fig, ax = plt.subplots(figsize=(7.5, 7.5))
@@ -90,9 +84,27 @@ def confusion_matrix_figure_tensor(
 
     img = Image.open(buf).convert("RGB")
     arr = np.asarray(img).astype(np.float32) / 255.0
-    ten = torch.from_numpy(arr).permute(2, 0, 1)
-    return ten
+    return torch.from_numpy(arr).permute(2, 0, 1)
 
+
+def confusion_matrix_figure_tensor(
+    preds: np.ndarray,
+    labels: np.ndarray,
+    num_classes: int,
+    normalize_rows: bool = True,
+) -> torch.Tensor:
+    """Build normalized confusion visualization as CHW float tensor [0,1]."""
+    preds = preds.astype(np.int64).ravel()
+    labels = labels.astype(np.int64).ravel()
+    cm = np.zeros((num_classes, num_classes), dtype=np.float64)
+    valid = (
+        (labels >= 0)
+        & (labels < num_classes)
+        & (preds >= 0)
+        & (preds < num_classes)
+    )
+    np.add.at(cm, (labels[valid], preds[valid]), 1.0)
+    return confusion_matrix_counts_figure_tensor(cm, normalize_rows=normalize_rows)
 
 def per_class_recall(
     preds: np.ndarray, labels: np.ndarray, num_classes: int
@@ -156,3 +168,24 @@ def log_segmentation_val_media(
             tb_add_scalar(trainer, f"{prefix}/per_class_recall/c{i:02d}", r, epoch)
 
     log_per_class_iou_scalars(trainer, preds_np, labels_np, num_classes, epoch, prefix)
+
+
+def log_segmentation_val_confusion(
+    trainer,
+    counts: np.ndarray,
+    epoch: int,
+    prefix: str = "val",
+) -> None:
+    """Log validation media/scalars without retaining every face prediction."""
+    cm = np.asarray(counts, dtype=np.float64)
+    img = confusion_matrix_counts_figure_tensor(cm)
+    tb_add_image(trainer, f"{prefix}/confusion_matrix", img, epoch)
+    rows = cm.sum(axis=1)
+    cols = cm.sum(axis=0)
+    diag = np.diag(cm)
+    for i in range(cm.shape[0]):
+        if rows[i] > 0:
+            tb_add_scalar(trainer, f"{prefix}/per_class_recall/c{i:02d}", float(diag[i] / rows[i]), epoch)
+        union = rows[i] + cols[i] - diag[i]
+        if rows[i] > 0 and cols[i] > 0 and union > 0:
+            tb_add_scalar(trainer, f"{prefix}/per_class_iou/c{i:02d}", float(diag[i] / union), epoch)

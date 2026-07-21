@@ -1,7 +1,5 @@
 import random
-import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 
 def bounding_box_uvgrid(inp_n: torch.Tensor, inp_e: torch.Tensor):
     pts_n = inp_n[..., :3].reshape((-1, 3))
@@ -39,27 +37,33 @@ def center_and_scale_pointcloud(pnts: torch.Tensor):
     return center, scale
 
 
+# Keep the original distribution: choose one of three axes, then one of four
+# quarter-turn angles. Identity intentionally appears three times (probability 1/4).
+_CANONICAL_ROTATIONS = (
+    torch.eye(3, dtype=torch.float32),
+    torch.tensor([[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=torch.float32),
+    torch.tensor([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=torch.float32),
+    torch.tensor([[1, 0, 0], [0, 0, 1], [0, -1, 0]], dtype=torch.float32),
+    torch.eye(3, dtype=torch.float32),
+    torch.tensor([[0, 0, 1], [0, 1, 0], [-1, 0, 0]], dtype=torch.float32),
+    torch.tensor([[-1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=torch.float32),
+    torch.tensor([[0, 0, -1], [0, 1, 0], [1, 0, 0]], dtype=torch.float32),
+    torch.eye(3, dtype=torch.float32),
+    torch.tensor([[0, -1, 0], [1, 0, 0], [0, 0, 1]], dtype=torch.float32),
+    torch.tensor([[-1, 0, 0], [0, -1, 0], [0, 0, 1]], dtype=torch.float32),
+    torch.tensor([[0, 1, 0], [-1, 0, 0], [0, 0, 1]], dtype=torch.float32),
+)
+
+
 def get_random_rotation():
-    """Get a random rotation in 90 degree increments along the canonical axes"""
-    axes = [
-        np.array([1, 0, 0]),
-        np.array([0, 1, 0]),
-        np.array([0, 0, 1]),
-    ]
-    angles = [0.0, 90.0, 180.0, 270.0]
-    axis = random.choice(axes)
-    angle_radians = np.radians(random.choice(angles))
-    return Rotation.from_rotvec(angle_radians * axis)
+    """Return a precomputed canonical-axis rotation (no per-sample SciPy work)."""
+    return random.choice(_CANONICAL_ROTATIONS)
 
 
 def rotate_uvgrid(inp, rotation):
-    """Rotate the node features in the graph by a given rotation"""
-    Rmat = torch.tensor(rotation.as_matrix()).float()
-    orig_size = inp[..., :3].size()
-    inp[..., :3] = torch.mm(inp[..., :3].view(-1, 3), Rmat).view(
-        orig_size
-    )  # Points
-    inp[..., 3:6] = torch.mm(inp[..., 3:6].view(-1, 3), Rmat).view(
-        orig_size
-    )  # Normals/tangents
+    """Rotate point and normal/tangent channels in-place."""
+    rotation = rotation.to(device=inp.device, dtype=inp.dtype)
+    point_shape = inp[..., :3].shape
+    inp[..., :3] = torch.mm(inp[..., :3].view(-1, 3), rotation).view(point_shape)
+    inp[..., 3:6] = torch.mm(inp[..., 3:6].view(-1, 3), rotation).view(point_shape)
     return inp

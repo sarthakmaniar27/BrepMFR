@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -42,6 +44,58 @@ def _split_stems(root: Path) -> list[str]:
     return stems
 
 
+def _rewrite_stem_file(path: Path, rejected: set[str]) -> int:
+    if not path.is_file():
+        return 0
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    kept = [stem for stem in lines if stem not in rejected]
+    removed = len(lines) - len(kept)
+    if removed:
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text("".join(f"{stem}\n" for stem in kept), encoding="utf-8")
+        os.replace(temporary, path)
+    return removed
+
+
+def _quarantine_invalid(
+    dataset_root: Path,
+    graph_paths: dict[str, Path],
+    errors: dict[str, str],
+) -> Path:
+    quarantine = dataset_root / "quarantine_invalid_graphs"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for stem in sorted(errors):
+            source = graph_paths[stem]
+            destination = quarantine / source.name
+            if destination.exists():
+                raise FileExistsError(f"Quarantine destination already exists: {destination}")
+            source.replace(destination)
+            moved.append((source, destination))
+    except Exception:
+        for source, destination in reversed(moved):
+            if destination.exists() and not source.exists():
+                destination.replace(source)
+        raise
+
+    rejected = set(errors)
+    split_removals = {
+        name: _rewrite_stem_file(dataset_root / f"{name}.txt", rejected)
+        for name in ("train", "val", "test")
+    }
+    abc_removed = _rewrite_stem_file(dataset_root / "abc_stems.txt", rejected)
+    report = {
+        "quarantined_count": len(errors),
+        "split_removals": split_removals,
+        "abc_manifest_removals": abc_removed,
+        "graphs": [{"stem": stem, "reason": errors[stem]} for stem in sorted(errors)],
+    }
+    report_path = quarantine / "report.json"
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    return report_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Check A1/A3 tensors, split coverage, and optional label parity with the lite dataset."
@@ -51,7 +105,15 @@ def main() -> int:
     parser.add_argument("--pt-subdir", default="pyg")
     parser.add_argument("--max-files", type=int, default=0, help="0 validates every split-listed graph.")
     parser.add_argument("--report-a3-cap", type=int, default=768)
+    parser.add_argument("--num-classes", type=int, default=3)
+    parser.add_argument(
+        "--quarantine-invalid",
+        action="store_true",
+        help="Move every invalid graph out of pyg and remove its stem from split/ABC lists.",
+    )
     args = parser.parse_args()
+    if args.quarantine_invalid and args.max_files > 0:
+        raise SystemExit("--quarantine-invalid requires a complete scan; do not use --max-files")
 
     dataset_root = args.dataset_root.resolve()
     graph_root = dataset_root / args.pt_subdir
@@ -87,7 +149,7 @@ def main() -> int:
     if args.max_files > 0:
         selected = selected[: args.max_files]
 
-    errors: list[str] = []
+    errors: dict[str, str] = {}
     max_nodes = 0
     above_cap = 0
     cap = int(args.report_a3_cap)
@@ -96,6 +158,16 @@ def main() -> int:
         try:
             graph = _load(graph_paths[stem])
             n = int(graph.node_data.size(0))
+            labels = getattr(graph, "label_feature", None)
+            if labels is None or labels.numel() == 0:
+                raise ValueError("label_feature is missing or empty")
+            label_min = int(labels.min().item())
+            label_max = int(labels.max().item())
+            if label_min < 0 or label_max >= int(args.num_classes):
+                raise ValueError(
+                    f"label range [{label_min}, {label_max}] is outside "
+                    f"[0, {int(args.num_classes) - 1}]"
+                )
             max_nodes = max(max_nodes, n)
             if cap > 0 and n > cap:
                 above_cap += 1
@@ -135,19 +207,28 @@ def main() -> int:
                 if tuple(graph.node_data.shape) != tuple(lite.node_data.shape):
                     raise ValueError("node_data shape differs from lite reference")
         except Exception as exc:
-            errors.append(f"{stem}: {exc}")
-            if len(errors) >= 20:
-                break
+            errors[stem] = str(exc)
 
-    print(f"\nValidated graphs: {len(selected) - len(errors):,} / {len(selected):,}")
+    print(f"\nValid graphs: {len(selected) - len(errors):,} / {len(selected):,}")
     print(f"Maximum face count observed: {max_nodes:,}")
     if cap > 0:
         print(f"Graphs above suggested A3 cap ({cap}): {above_cap:,}")
 
     if errors:
-        print("\nValidation failed:")
-        for error in errors:
-            print(f"  - {error}")
+        print(f"\nInvalid graphs: {len(errors):,}")
+        for stem, reason in list(errors.items())[:20]:
+            print(f"  - {stem}: {reason}")
+        if len(errors) > 20:
+            print(f"  ... and {len(errors) - 20:,} more (all are included in the report).")
+        if args.quarantine_invalid:
+            report_path = _quarantine_invalid(dataset_root, graph_paths, errors)
+            print(
+                f"\nQuarantined all {len(errors):,} invalid graphs and removed them from "
+                f"split/ABC lists.\nReport: {report_path}"
+            )
+            print("All remaining split-listed graphs passed validation.")
+            return 0
+        print("\nValidation failed. Rerun with --quarantine-invalid to exclude unusable graphs.")
         return 1
 
     print("A1+A3 profile, split coverage, and reference parity checks passed.")

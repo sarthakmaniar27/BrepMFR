@@ -34,16 +34,19 @@ class NonLinearClassifier(nn.Module):
             if m.bias is not None:
                 m.bias.data.fill_(0.0)
 
-    def forward(self, inp):
+    def forward_logits(self, inp):
         x = F.relu(self.bn1(self.linear1(inp)))
         x = self.dp1(x)
         x = F.relu(self.bn2(self.linear2(x)))
         x = self.dp2(x)
         x = F.relu(self.bn3(self.linear3(x)))
         x = self.dp3(x)
-        x = self.linear4(x)
-        x = F.softmax(x, dim=-1)
-        return x
+        return self.linear4(x)
+
+    def forward(self, inp):
+        # Keep the public/inference contract (probabilities), while training uses
+        # forward_logits + fused log-softmax losses below.
+        return F.softmax(self.forward_logits(inp), dim=-1)
 
 
 def CrossEntropyLoss(label, predict_prob, class_level_weight=None, instance_level_weight=None, epsilon=1e-12):
@@ -106,6 +109,30 @@ def FocalLoss(label, predict_prob, gamma=2.0, class_level_weight=None, epsilon=1
         loss = loss * cw
 
     return loss.sum() / float(N)
+
+
+def ClassificationLossFromLogits(
+    labels,
+    logits,
+    *,
+    loss_type="ce",
+    focal_gamma=2.0,
+    class_level_weight=None,
+):
+    """Numerically stable equivalent of the legacy softmax + one-hot losses."""
+    if loss_type == "focal":
+        log_p = F.log_softmax(logits, dim=-1)
+        log_pt = log_p.gather(1, labels.unsqueeze(1)).squeeze(1)
+        loss = -((1.0 - log_pt.exp()) ** focal_gamma) * log_pt
+        if class_level_weight is not None:
+            loss = loss * class_level_weight[labels]
+        return loss.sum() / labels.numel()
+    return F.cross_entropy(
+        logits,
+        labels,
+        weight=class_level_weight,
+        reduction="sum",
+    ) / labels.numel()
 
 
 class Attention(nn.Module):
@@ -195,6 +222,13 @@ class BrepSeg(pl.LightningModule):
 
         self.pred = []
         self.label = []
+        # Validation metrics stay on-device and synchronize once per epoch,
+        # instead of copying predictions to NumPy after every batch.
+        self.register_buffer(
+            "_val_confusion",
+            torch.zeros(self.num_classes, self.num_classes, dtype=torch.long),
+            persistent=False,
+        )
 
         # Optional: freeze encoder for first few epochs when fine-tuning
         self.warmup_freeze_epochs = getattr(args, "warmup_freeze_epochs", 0)
@@ -206,6 +240,10 @@ class BrepSeg(pl.LightningModule):
         self.optimizer_warmup_steps = int(getattr(args, "optimizer_warmup_steps", 5000))
         self.a1_a3_ramp_epochs = int(getattr(args, "a1_a3_ramp_epochs", 0))
         self.a1_a3_start_scale = float(getattr(args, "a1_a3_start_scale", 0.1))
+        self.check_val_every_n_epoch = max(
+            1, int(getattr(args, "check_val_every_n_epoch", 1))
+        )
+        self.fused_adamw = bool(getattr(args, "fused_adamw", False))
 
         # ---------------------------------------------------------
         # Loss function selection
@@ -266,7 +304,7 @@ class BrepSeg(pl.LightningModule):
         # ---------------------------------------------------------
         if getattr(args, "pre_train", None):
             print(f"\nLoading pretrained checkpoint from: {args.pre_train}")
-            ckpt = torch.load(args.pre_train, map_location="cpu")
+            ckpt = torch.load(args.pre_train, map_location="cpu", weights_only=False)
 
             # Lightning checkpoints usually store model weights in "state_dict"
             state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
@@ -394,9 +432,6 @@ class BrepSeg(pl.LightningModule):
             ds.subgraph_epoch = int(self.current_epoch)
 
     def training_step(self, batch, batch_idx):
-        self.brep_encoder.train()
-        self.attention.train()
-        self.classifier.train()
 
         # brep encoder----------------------------------------------------------------------------------
         with torch.profiler.record_function("brep_encoder"):
@@ -407,26 +442,24 @@ class BrepSeg(pl.LightningModule):
             node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
             node_emb = node_emb[:, 1:, :]            # node_emb [batch_size, max_node_num, dim] without global node
             padding_mask = batch["padding_mask"]     # [batch_size, max_node_num]
-            node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
+            node_pos = torch.where(~padding_mask)  # [(batch_size, node_index)]
             node_z = node_emb[node_pos]  # [total_nodes, dim_z]
-            padding_mask_ = ~padding_mask
-            num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
-            graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
+            # node_pos[0] is already the graph id for every flattened face.
+            graph_z = graph_emb[node_pos[0]]
             z = self.attention([node_z, graph_z])
-            node_seg = self.classifier(z) # [total_nodes, num_classes]
+            node_logits = self.classifier.forward_logits(z)  # [total_nodes, num_classes]
 
         # loss-------------------------------------------------------------------------------------------
         with torch.profiler.record_function("loss"):
             labels = batch["label_feature"].long()
-            labels_onehot = F.one_hot(labels, self.num_classes)
-            # Apply class weights only when --class_weights_path was provided.
-            # When unused, self.class_weights is all-1.0 and the result is identical
-            # to unweighted CE, but we still pass None to skip a few ops.
             cw = self.class_weights if self.use_class_weights else None
-            if self.loss_type == "focal":
-                loss = FocalLoss(labels_onehot, node_seg, gamma=self.focal_gamma, class_level_weight=cw)
-            else:
-                loss = CrossEntropyLoss(labels_onehot, node_seg, class_level_weight=cw)
+            loss = ClassificationLossFromLogits(
+                labels,
+                node_logits,
+                loss_type=self.loss_type,
+                focal_gamma=self.focal_gamma,
+                class_level_weight=cw,
+            )
         bs = int(labels.shape[0])
         self.log(
             "train_loss",
@@ -454,9 +487,6 @@ class BrepSeg(pl.LightningModule):
 
 
     def validation_step(self, batch, batch_idx):
-        self.brep_encoder.eval()
-        self.attention.eval()
-        self.classifier.eval()
 
         with torch.profiler.record_function("brep_encoder"):
             node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)  # logits [total_nodes, num_classes]
@@ -465,31 +495,22 @@ class BrepSeg(pl.LightningModule):
             node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
             node_emb = node_emb[:, 1:, :]            # node_emb [batch_size, max_node_num, dim] without global node
             padding_mask = batch["padding_mask"]     # [batch_size, max_node_num]
-            node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
+            node_pos = torch.where(~padding_mask)  # [(batch_size, node_index)]
             node_z = node_emb[node_pos]  # [total_nodes, dim]
-            padding_mask_ = ~padding_mask
-            num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
-            graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
+            graph_z = graph_emb[node_pos[0]]
             z = self.attention([node_z, graph_z])
-            node_seg = self.classifier(z)  # [total_nodes, num_classes]
+            node_logits = self.classifier.forward_logits(z)  # [total_nodes, num_classes]
 
         with torch.profiler.record_function("loss"):
             labels = batch["label_feature"].long()  # labels [total_nodes]
-            labels_np = labels.long().detach().cpu().numpy()
-            labels_onehot = F.one_hot(labels, self.num_classes)
-            # Use the SAME loss as training_step (weighted CE or Focal Loss +
-            # class weights) so eval_loss reflects the true training objective
-            # rather than a majority-class-dominated plain CE.
             cw = self.class_weights if self.use_class_weights else None
-            if self.loss_type == "focal":
-                loss = FocalLoss(
-                    labels_onehot, node_seg,
-                    gamma=self.focal_gamma, class_level_weight=cw,
-                )
-            else:
-                loss = CrossEntropyLoss(
-                    labels_onehot, node_seg, class_level_weight=cw,
-                )
+            loss = ClassificationLossFromLogits(
+                labels,
+                node_logits,
+                loss_type=self.loss_type,
+                focal_gamma=self.focal_gamma,
+                class_level_weight=cw,
+            )
             self.log(
                 "eval_loss",
                 loss,
@@ -498,10 +519,15 @@ class BrepSeg(pl.LightningModule):
                 batch_size=int(labels.shape[0]),
             )
 
-        preds = torch.argmax(node_seg, dim=-1)  # pres [total_nodes]
-        preds_np = preds.long().detach().cpu().numpy()
-        for i in range(len(preds_np)): self.pred.append(preds_np[i])
-        for i in range(len(labels_np)): self.label.append(labels_np[i])
+        preds = torch.argmax(node_logits, dim=-1)  # preds [total_nodes]
+        valid = (labels >= 0) & (labels < self.num_classes)
+        encoded = labels[valid] * self.num_classes + preds[valid]
+        self._val_confusion.add_(
+            torch.bincount(
+                encoded,
+                minlength=self.num_classes * self.num_classes,
+            ).reshape(self.num_classes, self.num_classes)
+        )
 
         if (
             batch_idx == 0
@@ -510,7 +536,7 @@ class BrepSeg(pl.LightningModule):
         ):
             from models.tensorboard_media import tb_add_histogram
 
-            mx = node_seg.max(dim=-1).values.detach().cpu()
+            mx = node_logits.softmax(dim=-1).max(dim=-1).values.detach().cpu()
             tb_add_histogram(
                 self.trainer,
                 "val/max_pred_prob_batch0",
@@ -520,74 +546,58 @@ class BrepSeg(pl.LightningModule):
 
         return loss
 
+    def on_validation_epoch_start(self):
+        self._val_confusion.zero_()
+
     def on_validation_epoch_end(self):
-        preds_np = np.array(self.pred)
-        labels_np = np.array(self.label)
-        self.pred = []
-        self.label = []
-        per_face_comp = (preds_np == labels_np).astype(np.int64)
-        self.log("per_face_accuracy", np.mean(per_face_comp))
+        cm = self._val_confusion.detach().cpu().numpy().astype(np.float64)
+        total = float(cm.sum())
+        if total <= 0:
+            return
 
-        # ---------------------------------------------------------
-        # Per-class accuracy — critical for imbalanced datasets
-        # where per_face_accuracy is dominated by the majority class.
-        # ---------------------------------------------------------
-        per_class_acc = []
-        for i in range(self.num_classes):
-            class_pos = np.where(labels_np == i)
-            if len(class_pos[0]) > 0:
-                class_i_preds = preds_np[class_pos]
-                class_i_label = labels_np[class_pos]
-                acc = float(np.mean((class_i_preds == class_i_label).astype(np.int64)))
-                per_class_acc.append(acc)
-                self.log(f"val_class_{i}_acc", acc)
-            else:
-                per_class_acc.append(0.0)
-        if per_class_acc:
-            self.log("per_class_accuracy", float(np.mean(per_class_acc)))
+        rows = cm.sum(axis=1)
+        cols = cm.sum(axis=0)
+        diag = np.diag(cm)
+        self.log("per_face_accuracy", float(diag.sum() / total))
 
-        # Feature-only accuracy (excludes stock = class 0)
-        feature_pos = np.where(labels_np > 0)
-        if len(feature_pos[0]) > 0:
-            feature_pred = preds_np[feature_pos]
-            feature_label = labels_np[feature_pos]
-            feature_acc = float(np.mean((feature_pred == feature_label).astype(np.int64)))
-            self.log("per_face_accuracy_feature", feature_acc)
+        per_class_acc = np.divide(
+            diag,
+            rows,
+            out=np.zeros_like(diag, dtype=np.float64),
+            where=rows > 0,
+        )
+        for i, acc in enumerate(per_class_acc):
+            self.log(f"val_class_{i}_acc", float(acc))
+        self.log("per_class_accuracy", float(per_class_acc.mean()))
 
-        # IoU
+        feature_total = float(rows[1:].sum())
+        if feature_total > 0:
+            self.log(
+                "per_face_accuracy_feature",
+                float(diag[1:].sum() / feature_total),
+            )
+
         per_class_iou = []
         for i in range(self.num_classes):
-            label_pos = np.where(labels_np == i)[0]
-            pred_pos = np.where(preds_np == i)[0]
-            if len(pred_pos) > 0 and len(label_pos) > 0:
-                class_i_preds = preds_np[label_pos]
-                class_i_label = labels_np[label_pos]
-                intersection = (class_i_preds == class_i_label).astype(np.int64)
-                union_fn = (class_i_preds != class_i_label).astype(np.int64)
-                class_i_preds_ = preds_np[pred_pos]
-                class_i_label_ = labels_np[pred_pos]
-                union_fp = (class_i_preds_ != class_i_label_).astype(np.int64)
-                iou = float(np.sum(intersection) / (np.sum(union_fn) + np.sum(intersection) + np.sum(union_fp) + 1e-9))
-                per_class_iou.append(iou)
+            union = rows[i] + cols[i] - diag[i]
+            # Preserve the legacy definition: only classes present in both the
+            # labels and predictions contribute to mean IoU.
+            if rows[i] > 0 and cols[i] > 0 and union > 0:
+                per_class_iou.append(float(diag[i] / union))
         if per_class_iou:
             self.log("IoU", float(np.mean(per_class_iou)))
 
         if self.trainer.is_global_zero:
-            from models.tensorboard_media import log_segmentation_val_media
+            from models.tensorboard_media import log_segmentation_val_confusion
 
-            log_segmentation_val_media(
+            log_segmentation_val_confusion(
                 self.trainer,
-                preds_np,
-                labels_np,
-                self.num_classes,
+                cm,
                 int(self.current_epoch),
                 prefix="val",
             )
 
     def test_step(self, batch, batch_idx):
-        self.brep_encoder.eval()
-        self.attention.eval()
-        self.classifier.eval()
 
         # brep encoder----------------------------------------------------------------------------------
         node_emb, graph_emb = self.brep_encoder(batch, last_state_only=True)  # logits [total_nodes, num_classes]
@@ -596,15 +606,13 @@ class BrepSeg(pl.LightningModule):
         node_emb = node_emb[0].permute(1, 0, 2)  # node_emb [batch_size, max_node_num+1, dim] with global node dim=0
         node_emb = node_emb[:, 1:, :]  # node_emb [batch_size, max_node_num, dim] without global node
         padding_mask = batch["padding_mask"]  # [batch_size, max_node_num]
-        node_pos = torch.where(padding_mask == False)  # [(batch_size, node_index)]
+        node_pos = torch.where(~padding_mask)  # [(batch_size, node_index)]
         node_z = node_emb[node_pos]  # [total_nodes, dim]
-        padding_mask_ = ~padding_mask
-        num_nodes_per_graph = torch.sum(padding_mask_.long(), dim=-1)  # [batch_size]
-        graph_z = graph_emb.repeat_interleave(num_nodes_per_graph, dim=0).to(graph_emb.device)
+        graph_z = graph_emb[node_pos[0]]
         z = self.attention([node_z, graph_z])
-        node_seg = self.classifier(z)  # [total_nodes, num_classes]
+        node_logits = self.classifier.forward_logits(z)  # [total_nodes, num_classes]
 
-        preds = torch.argmax(node_seg, dim=-1)  # pres [total_nodes]
+        preds = torch.argmax(node_logits, dim=-1)  # preds [total_nodes]
         labels = batch["label_feature"].long()  # labels [total_nodes]
         known_pos = torch.where(labels < self.num_classes)
         labels_ = labels[known_pos]
@@ -800,18 +808,27 @@ class BrepSeg(pl.LightningModule):
                 "name": "a1_a3_bias",
             },
         ]
-        optimizer = torch.optim.AdamW(
-            parameter_groups,
+        optimizer_kwargs = dict(
             lr=self.learning_rate,
             betas=(0.9, 0.999),
             eps=1e-8,
             weight_decay=0.01,
         )
+        if self.fused_adamw and torch.cuda.is_available():
+            optimizer_kwargs["fused"] = True
+        try:
+            optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
+        except (TypeError, RuntimeError) as exc:
+            if "fused" not in optimizer_kwargs:
+                raise
+            print(f"Fused AdamW unavailable ({exc}); using foreach/default AdamW.", flush=True)
+            optimizer_kwargs.pop("fused")
+            optimizer = torch.optim.AdamW(parameter_groups, **optimizer_kwargs)
         print(
             "Optimizer learning rates: "
             f"backbone={self.learning_rate:g}, "
             f"A1/A3={self.a1_a3_learning_rate:g}, "
-            f"warmup_steps={self.optimizer_warmup_steps}",
+            f"warmup_steps={self.optimizer_warmup_steps}, fused={optimizer_kwargs.get('fused', False)}",
             flush=True,
         )
 
@@ -838,7 +855,7 @@ class BrepSeg(pl.LightningModule):
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "epoch",
-                "frequency": 1,
+                "frequency": self.check_val_every_n_epoch,
                 "monitor": "per_class_accuracy",
             },
         }

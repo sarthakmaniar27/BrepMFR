@@ -454,12 +454,14 @@ class GraphAttnBias(nn.Module):
 
             spatial_pos_bias = self.spatial_pos_encoder(spatial_pos)
             spatial_pos_bias = spatial_pos_bias.permute(0, 3, 1, 2)
-            spatial_pos_bias = spatial_pos_bias * self.a1_a3_scale
+            # a1_a3_scale is a float32 buffer; cast under AMP so half activations stay half.
+            a1_a3_scale = self.a1_a3_scale.to(dtype=spatial_pos_bias.dtype)
+            spatial_pos_bias = spatial_pos_bias * a1_a3_scale
             graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + spatial_pos_bias
 
             t = (
                 self.graph_token_virtual_distance.weight.view(1, self.num_heads, 1)
-                * self.a1_a3_scale
+                * a1_a3_scale
             )
             graph_attn_bias[:, :, 1:, 0] = graph_attn_bias[:, :, 1:, 0] + t
             graph_attn_bias[:, :, 0, :] = graph_attn_bias[:, :, 0, :] + t
@@ -469,13 +471,17 @@ class GraphAttnBias(nn.Module):
             d2_pos_bias = self.d2_pos_encoder(d2_distance)
             d2_pos_bias = d2_pos_bias.reshape(n_graph, n_node, n_node, self.num_heads)
             d2_pos_bias = d2_pos_bias.permute(0, 3, 1, 2)
-            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + d2_pos_bias
+            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + d2_pos_bias.to(
+                dtype=graph_attn_bias.dtype
+            )
 
             ang_distance = ang_distance.reshape(-1, 64)
             ang_pos_bias = self.ang_pos_encoder(ang_distance)
             ang_pos_bias = ang_pos_bias.reshape(n_graph, n_node, n_node, self.num_heads)
             ang_pos_bias = ang_pos_bias.permute(0, 3, 1, 2)
-            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + ang_pos_bias
+            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + ang_pos_bias.to(
+                dtype=graph_attn_bias.dtype
+            )
 
         # edge_feature 边编码------------------------------------------------------------------------------------------------------------
         if run_a3:
@@ -569,11 +575,14 @@ class GraphAttnBias(nn.Module):
             edge_feat_ = self.node_cat(edge_index, node_feat, edge_feat)  # [total_edges, n_head]
 
             # Edge input expansion [total_edges, n_head]->[n_graph, max_node_num, max_node_num, max_dist, n_head]
+            # new_zeros + explicit cast: under AMP, BatchNorm/MLP paths can disagree on float16 vs float32.
             n_edge = edge_padding_mask.size(1)
-            edge_feature = torch.zeros([n_graph, (n_edge + 1), edge_feat_.size(-1)], device=edge_data.device, dtype=edge_data.dtype)
-            edge_feature[edge_pos] = edge_feat_[:][:]  # edge_feature[n_graph, max_edge_num+1, n_head]
+            edge_feature = edge_feat_.new_zeros(
+                (n_graph, n_edge + 1, edge_feat_.size(-1))
+            )
+            edge_feature[edge_pos] = edge_feat_.to(dtype=edge_feature.dtype)
 
-            edge_path = edge_path.reshape(n_graph, n_node * n_node * max_dist)
+            edge_path = edge_path.reshape(n_graph, n_node * n_node, max_dist)
 
 
             
@@ -585,7 +594,7 @@ class GraphAttnBias(nn.Module):
             edge_path = edge_path.clamp(0, pad_idx)
 
 
-            dim_0 = torch.arange(n_graph, device=edge_path.device).reshape(n_graph, 1).long()
+            dim_0 = torch.arange(n_graph, device=edge_path.device).reshape(n_graph, 1, 1)
 
             # ---- DEBUG: edge_path sanity ----
             # if self._dbg_done < 5:
@@ -625,28 +634,23 @@ class GraphAttnBias(nn.Module):
 
 
 
+            # Algebraically fuse the per-hop head transforms and hop reduction:
+            #   sum_d(edge[d] @ W[d]) == cat(edge[d]) @ cat(W[d]).
+            # The old bmm materialized another [D, B*N*N, H] tensor (several GB
+            # at the adaptive batch budget). This produces only [B*N*N, H].
             edge_bias = edge_feature[dim_0, edge_path]
-            edge_bias = edge_bias.reshape(n_graph, n_node, n_node, max_dist, self.num_heads)
-
-            edge_bias = edge_bias.permute(3, 0, 1, 2, 4).reshape(max_dist, -1, self.num_heads)
-            # permute转为[max_dist, n_graph, max_node_num, max_node_num, n_head]
-            # reshape转为[max_dist, ---, n_head]
-
-            # 乘以edge_dis_encoder系数，边特征权重按距离递减，超出max_dist后减为0
-            edge_bias = torch.bmm(
-                edge_bias,
-                self.edge_dis_encoder.weight.reshape(
-                    -1, self.num_heads, self.num_heads
-                )[:max_dist, :, :],
-            )
-            edge_bias = edge_bias.reshape(
-                max_dist, n_graph, n_node, n_node, self.num_heads
-            ).permute(1, 2, 3, 0, 4)  # edge_input[n_graph, max_node_num, max_node_num, max_dist, n_head]
-            # 各个edge上的特征求和取均值
-            edge_bias = (edge_bias.sum(-2) / (spatial_pos_.float().unsqueeze(-1))) # edge_input[n_graph, max_node_num, max_node_num, n_head]
+            edge_dis_weight = self.edge_dis_encoder.weight.reshape(
+                -1, self.num_heads, self.num_heads
+            )[:max_dist].reshape(max_dist * self.num_heads, self.num_heads)
+            edge_bias = torch.matmul(
+                edge_bias.flatten(start_dim=-2), edge_dis_weight
+            ).reshape(n_graph, n_node, n_node, self.num_heads)
+            edge_bias = edge_bias / spatial_pos_.to(edge_bias.dtype).unsqueeze(-1)
             edge_bias = edge_bias.permute(0, 3, 1, 2)
-            edge_bias = edge_bias * self.a1_a3_scale
-            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + edge_bias
+            edge_bias = edge_bias * self.a1_a3_scale.to(dtype=edge_bias.dtype)
+            graph_attn_bias[:, :, 1:, 1:] = graph_attn_bias[:, :, 1:, 1:] + edge_bias.to(
+                dtype=graph_attn_bias.dtype
+            )
         # edge_feature 边编码------------------------------------------------------------------------------------------------------------
 
         graph_attn_bias = graph_attn_bias + attn_bias.unsqueeze(1)  # reset

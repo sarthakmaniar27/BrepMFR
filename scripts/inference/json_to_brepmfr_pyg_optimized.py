@@ -63,6 +63,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import time
 import traceback
 from collections import deque, defaultdict
@@ -1564,6 +1565,7 @@ def main():
     ok = 0
     skipped = 0
     failed = 0
+    consecutive_output_open_failures = 0
     conversion_times = []
     wall_start = time.time()
 
@@ -1593,10 +1595,27 @@ def main():
                 npz_direct=not args.no_npz_direct,
             )
             ok += 1
+            consecutive_output_open_failures = 0
         except Exception as e:
             print(f"\n[FAIL] {jp.name}: {e}")
             traceback.print_exc()
             failed += 1
+            message = str(e).lower()
+            if "cannot be opened" in message or "pytorchfilewriter" in message:
+                consecutive_output_open_failures += 1
+                if consecutive_output_open_failures >= 3:
+                    try:
+                        free_gb = shutil.disk_usage(pt_out_dir).free / (1024 ** 3)
+                        free_text = f"{free_gb:.2f} GiB"
+                    except OSError:
+                        free_text = "unknown"
+                    raise RuntimeError(
+                        "Aborting after 3 consecutive output-open failures. "
+                        f"Destination={pt_out_dir}; free space={free_text}. "
+                        "Check disk space, directory existence, permissions, and concurrent writers."
+                    ) from e
+            else:
+                consecutive_output_open_failures = 0
         conversion_times.append(time.perf_counter() - t0)
 
     wall_total = time.time() - wall_start

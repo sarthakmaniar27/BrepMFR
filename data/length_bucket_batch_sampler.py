@@ -1,25 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Length-bucketed batch sampler for BrepMFR graph segmentation.
+"""Cost-aware batch sampling for dense B-rep graph attention.
 
-Groups graphs by face-count bucket so that large graphs (complex 3D parts
-with many faces) always land in small (size-1 or size-2) batches, preventing
-O(N^2) attention OOM spikes while keeping all training data.
+The legacy three-bucket policy is retained. When ``node_sq_budget`` is set,
+similarly sized graphs are greedily packed while enforcing
 
-Bucket thresholds and per-bucket batch sizes (derived from ``base_batch_size``):
-  - small  (<= bucket_small_max,  default 150): batch_size = base_batch_size
-  - medium (<= bucket_medium_max, default 300): batch_size = max(1, base_batch_size // 2)
-  - large  (>  bucket_medium_max):              batch_size = 1
+    batch_size * padded_max_nodes**2 <= node_sq_budget
 
-**Preferred**: pass ``node_counts`` (a list of actual node counts, one per
-file in ``file_paths``) obtained from ``CADSynth._actual_node_counts`` after
-the ``--drop_invalid_graphs`` scan.  This is the most reliable source.
-
-**Fallback**: when ``node_counts`` is ``None``, face counts are parsed from
-the trailing ``_N`` integer in each ``.pt`` filename (e.g.
-``00000000_both_v3_104.pt`` -> 104).  Files whose stem does not match
-``_(\\d+)$`` receive face count = 0 and land in the *small* bucket.
-**This is unsafe if those files are actually large** — always prefer passing
-real ``node_counts`` from the dataset scan.
+This approximates the dominant padded self-attention cost. Graphs above and
+below ``a3_node_cap`` are packed separately so an oversized graph never
+disables A3 for eligible graphs in the same batch.
 """
 from __future__ import annotations
 
@@ -34,27 +23,13 @@ _FACE_COUNT_RE = re.compile(r"_(\d+)$")
 
 
 def parse_face_count(path) -> int:
-    """Extract the trailing integer (face count) from a .pt filename stem.
-
-    Returns 0 for filenames that do not end with ``_<digits>``.  A return
-    value of 0 means the face count is *unknown*, not that the graph is
-    empty.  Callers should treat 0 as a sentinel and fall back to the actual
-    node count loaded from the .pt file.
-    """
-    stem = pathlib.Path(path).stem
-    m = _FACE_COUNT_RE.search(stem)
-    return int(m.group(1)) if m else 0
+    """Extract a trailing ``_<digits>`` face count, or zero when unknown."""
+    match = _FACE_COUNT_RE.search(pathlib.Path(path).stem)
+    return int(match.group(1)) if match else 0
 
 
 class LengthBucketBatchSampler:
-    """Batch sampler that buckets graphs by face count to prevent OOM spikes.
-
-    Yields lists of dataset indices. When ``shuffle=True`` the indices within
-    each bucket and the order of batches are re-shuffled on every ``__iter__``
-    call (i.e. every epoch) using an internal epoch counter, so each epoch
-    sees a different batch composition while large graphs never share a batch
-    with another large graph.
-    """
+    """Yield length-local batches using a legacy or quadratic-budget policy."""
 
     def __init__(
         self,
@@ -66,6 +41,8 @@ class LengthBucketBatchSampler:
         seed: int = 0,
         bucket_small_max: int = 150,
         bucket_medium_max: int = 300,
+        node_sq_budget: Optional[int] = None,
+        a3_node_cap: Optional[int] = None,
         drop_last: bool = False,
     ):
         if base_batch_size < 1:
@@ -77,54 +54,105 @@ class LengthBucketBatchSampler:
                 f"node_counts length ({len(node_counts)}) must match "
                 f"file_paths length ({len(file_paths)})"
             )
+
         self.base_batch_size = int(base_batch_size)
         self.shuffle = bool(shuffle)
         self.seed = int(seed)
         self.bucket_small_max = int(bucket_small_max)
         self.bucket_medium_max = int(bucket_medium_max)
+        self.node_sq_budget = (
+            int(node_sq_budget)
+            if node_sq_budget is not None and int(node_sq_budget) > 0
+            else None
+        )
+        self.a3_node_cap = (
+            int(a3_node_cap)
+            if a3_node_cap is not None and int(a3_node_cap) > 0
+            else None
+        )
         self.drop_last = bool(drop_last)
         self.epoch = 0
+        self._n_samples = len(file_paths)
+
+        counts: List[int] = []
+        unknown_count = 0
+        for index, path in enumerate(file_paths):
+            count = (
+                int(node_counts[index])
+                if node_counts is not None
+                else parse_face_count(path)
+            )
+            if count <= 0:
+                unknown_count += 1
+                # A count above sqrt(budget) forces a safe singleton.
+                count = max(self.node_sq_budget or 1, 1)
+            counts.append(count)
+        self._node_counts = counts
+
+        source = "actual node counts" if node_counts is not None else "filename parsing"
+        if unknown_count:
+            print(
+                f"LengthBucketBatchSampler: {unknown_count} unknown face counts; "
+                "keeping them singleton-safe.",
+                flush=True,
+            )
+
+        if self.node_sq_budget is not None:
+            self._buckets = []
+            if self.a3_node_cap is None:
+                self._adaptive_groups = [list(range(self._n_samples))]
+            else:
+                self._adaptive_groups = [
+                    [
+                        index
+                        for index, count in enumerate(counts)
+                        if count <= self.a3_node_cap
+                    ],
+                    [
+                        index
+                        for index, count in enumerate(counts)
+                        if count > self.a3_node_cap
+                    ],
+                ]
+            preview_batches = self._make_adaptive_batches(shuffle_batches=False)
+            self._cached_len = len(preview_batches)
+            padded_cost = sum(
+                len(batch) * max(counts[index] for index in batch) ** 2
+                for batch in preview_batches
+            )
+            raw_cost = sum(count * count for count in counts)
+            packing_efficiency = raw_cost / padded_cost if padded_cost else 1.0
+            mean_graphs = self._n_samples / max(1, self._cached_len)
+            max_graphs = max((len(batch) for batch in preview_batches), default=0)
+            print(
+                f"QuadraticBudgetBatchSampler source={source}: "
+                f"samples={self._n_samples:,} | max_graphs={self.base_batch_size} | "
+                f"node_sq_budget={self.node_sq_budget:,} | "
+                f"A3 split cap={self.a3_node_cap or 'disabled'} | "
+                f"batches={self._cached_len:,} | mean_graphs/batch={mean_graphs:.1f} | "
+                f"largest_batch={max_graphs} | padding_efficiency={packing_efficiency:.1%}",
+                flush=True,
+            )
+            return
 
         small_bs = self.base_batch_size
         medium_bs = max(1, self.base_batch_size // 2)
         large_bs = 1
-
-        unknown_count = 0
         small_idx: List[int] = []
         medium_idx: List[int] = []
         large_idx: List[int] = []
-        for i, p in enumerate(file_paths):
-            if node_counts is not None:
-                fc = int(node_counts[i])
+        for index, count in enumerate(counts):
+            if count <= self.bucket_small_max:
+                small_idx.append(index)
+            elif count <= self.bucket_medium_max:
+                medium_idx.append(index)
             else:
-                fc = parse_face_count(p)
-                if fc == 0:
-                    # filename did not contain a face count -> unknown size.
-                    # Treat as large (bs=1) to be safe; never pair unknowns.
-                    unknown_count += 1
-                    large_idx.append(i)
-                    continue
-            if fc <= self.bucket_small_max:
-                small_idx.append(i)
-            elif fc <= self.bucket_medium_max:
-                medium_idx.append(i)
-            else:
-                large_idx.append(i)
-
+                large_idx.append(index)
         self._buckets = [
             (small_idx, small_bs),
             (medium_idx, medium_bs),
             (large_idx, large_bs),
         ]
-        self._n_samples = len(file_paths)
-        source = "actual node counts" if node_counts is not None else "filename parsing"
-        if unknown_count:
-            print(
-                f"LengthBucketBatchSampler: {unknown_count} files had no face count in "
-                f"their filename -> treated as large (bs=1). "
-                f"Pass node_counts= for accurate bucketing.",
-                flush=True,
-            )
         print(
             f"LengthBucketBatchSampler source={source}: "
             f"small(<={bucket_small_max}) n={len(small_idx)} bs={small_bs} | "
@@ -133,39 +161,85 @@ class LengthBucketBatchSampler:
             flush=True,
         )
 
-    def _make_batches(self) -> List[List[int]]:
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
+    def _make_adaptive_batches(self, *, shuffle_batches: bool = True) -> List[List[int]]:
+        """Pack similarly sized graphs under the padded quadratic-cost budget."""
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
         batches: List[List[int]] = []
-        for indices, bs in self._buckets:
+
+        for group in self._adaptive_groups:
+            tie_breakers = (
+                torch.rand(len(group), generator=generator).tolist()
+                if self.shuffle
+                else [0.0] * len(group)
+            )
+            order = sorted(
+                zip(group, tie_breakers),
+                key=lambda pair: (self._node_counts[pair[0]], pair[1]),
+            )
+            current: List[int] = []
+            current_max = 0
+            for index, _ in order:
+                node_count = self._node_counts[index]
+                projected_max = max(current_max, node_count)
+                projected_size = len(current) + 1
+                projected_cost = projected_size * projected_max * projected_max
+                if current and (
+                    projected_size > self.base_batch_size
+                    or projected_cost > self.node_sq_budget
+                ):
+                    batches.append(current)
+                    current = []
+                    current_max = 0
+                current.append(index)
+                current_max = max(current_max, node_count)
+            if current and (not self.drop_last or len(current) == self.base_batch_size):
+                batches.append(current)
+
+        if self.shuffle and shuffle_batches and batches:
+            permutation = torch.randperm(len(batches), generator=generator).tolist()
+            batches = [batches[index] for index in permutation]
+        return batches
+
+    def _make_legacy_batches(self) -> List[List[int]]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        batches: List[List[int]] = []
+        for indices, batch_size in self._buckets:
             if not indices:
                 continue
             order = indices
             if self.shuffle:
-                perm = torch.randperm(len(indices), generator=g).tolist()
-                order = [indices[i] for i in perm]
-            for start in range(0, len(order), bs):
-                batch = order[start:start + bs]
-                if self.drop_last and len(batch) < bs:
+                permutation = torch.randperm(
+                    len(indices), generator=generator
+                ).tolist()
+                order = [indices[index] for index in permutation]
+            for start in range(0, len(order), batch_size):
+                batch = order[start : start + batch_size]
+                if self.drop_last and len(batch) < batch_size:
                     continue
                 batches.append(batch)
         if self.shuffle and batches:
-            perm = torch.randperm(len(batches), generator=g).tolist()
-            batches = [batches[i] for i in perm]
+            permutation = torch.randperm(len(batches), generator=generator).tolist()
+            batches = [batches[index] for index in permutation]
         return batches
 
     def __iter__(self):
         if self.shuffle:
             self.epoch += 1
-        return iter(self._make_batches())
+        if self.node_sq_budget is not None:
+            return iter(self._make_adaptive_batches())
+        return iter(self._make_legacy_batches())
 
     def __len__(self) -> int:
+        if self.node_sq_budget is not None:
+            return self._cached_len
         total = 0
-        for indices, bs in self._buckets:
+        for indices, batch_size in self._buckets:
             if not indices:
                 continue
-            n = len(indices)
-            total += n // bs
-            if n % bs and not self.drop_last:
+            count = len(indices)
+            total += count // batch_size
+            if count % batch_size and not self.drop_last:
                 total += 1
         return total

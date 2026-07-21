@@ -45,7 +45,7 @@ if ($UseFastUpgrade) {
         "--spatial-pos-max", "32",
         "--max-edge-path-len", "16"
     )
-    & conda run -n $CondaEnv python @upgradeArgs
+    & conda run --no-capture-output -n $CondaEnv python @upgradeArgs
     if ($LASTEXITCODE -ne 0) {
         throw "A1+A3 lite upgrade failed with exit code $LASTEXITCODE"
     }
@@ -71,7 +71,7 @@ if ($UseFastUpgrade) {
     } elseif ($AbcJsonDir) {
         throw "ABC JSON directory not found: $AbcJsonDir"
     }
-    & conda run -n $CondaEnv python @convertArgs
+    & conda run --no-capture-output -n $CondaEnv python @convertArgs
     if ($LASTEXITCODE -ne 0) {
         throw "A1+A3 conversion failed with exit code $LASTEXITCODE"
     }
@@ -96,7 +96,7 @@ $validateArgs = @(
 if ($ValidationMaxFiles -gt 0) {
     $validateArgs += @("--max-files", [string]$ValidationMaxFiles)
 }
-& conda run -n $CondaEnv python @validateArgs
+& conda run --no-capture-output -n $CondaEnv python @validateArgs
 if ($LASTEXITCODE -ne 0) {
     throw "A1+A3 dataset validation failed with exit code $LASTEXITCODE"
 }

@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 import torch
 from ..utils.fairseq_shim import FairseqDropout, quant_noise, softmax
 from torch import Tensor, nn
+import torch.nn.functional as F
 
 
 class MultiheadAttention(nn.Module):
@@ -42,6 +43,7 @@ class MultiheadAttention(nn.Module):
         self.scaling = self.head_dim ** -0.5
 
         self.self_attention = self_attention
+        self.q_noise = float(q_noise)
 
         assert self.self_attention, "Only support self attention"
 
@@ -129,9 +131,26 @@ class MultiheadAttention(nn.Module):
                 assert value is not None
                 assert src_len, bsz == value.shape[:2]
 
-        q = self.q_proj(query)
-        k = self.k_proj(query)
-        v = self.v_proj(query)
+        if self.q_noise == 0.0:
+            # One larger GEMM has materially better occupancy than three small
+            # projections, while keeping the original q/k/v parameters and
+            # checkpoint keys intact.
+            in_proj_weight = torch.cat(
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight), dim=0
+            )
+            if self.q_proj.bias is None:
+                in_proj_bias = None
+            else:
+                in_proj_bias = torch.cat(
+                    (self.q_proj.bias, self.k_proj.bias, self.v_proj.bias), dim=0
+                )
+            q, k, v = F.linear(query, in_proj_weight, in_proj_bias).chunk(3, dim=-1)
+        else:
+            # quant_noise is implemented with per-module forward hooks, so keep
+            # the individual projection calls when it is enabled.
+            q = self.q_proj(query)
+            k = self.k_proj(query)
+            v = self.v_proj(query)
         q *= self.scaling
 
         q = (
@@ -163,6 +182,51 @@ class MultiheadAttention(nn.Module):
         if key_padding_mask is not None:
             assert key_padding_mask.size(0) == bsz
             assert key_padding_mask.size(1) == src_len
+
+        # Encoder layers never request attention weights. Use PyTorch's fused
+        # scaled-dot-product attention in that path; q already includes the
+        # legacy head_dim**-0.5 scaling, hence scale=1.0 below.
+        if (
+            not need_weights
+            and not before_softmax
+            and attn_mask is None
+            and hasattr(F, "scaled_dot_product_attention")
+        ):
+            q_sdpa = q.view(bsz, self.num_heads, tgt_len, self.head_dim)
+            k_sdpa = k.view(bsz, self.num_heads, src_len, self.head_dim)
+            v_sdpa = v.view(bsz, self.num_heads, src_len, self.head_dim)
+            additive_mask = None
+            if attn_bias is not None:
+                additive_mask = attn_bias.view(
+                    bsz, self.num_heads, tgt_len, src_len
+                ).to(dtype=q_sdpa.dtype)
+            if key_padding_mask is not None:
+                if additive_mask is None:
+                    additive_mask = torch.zeros(
+                        (bsz, 1, tgt_len, src_len),
+                        dtype=q_sdpa.dtype,
+                        device=q_sdpa.device,
+                    )
+                additive_mask = additive_mask.masked_fill(
+                    key_padding_mask[:, None, None, :].to(torch.bool),
+                    float("-inf"),
+                )
+            attn = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                attn_mask=additive_mask,
+                dropout_p=self.dropout_module.p if self.training else 0.0,
+                is_causal=False,
+                scale=1.0,
+            )
+            attn = (
+                attn.permute(2, 0, 1, 3)
+                .contiguous()
+                .view(tgt_len, bsz, embed_dim)
+            )
+            return self.out_proj(attn), None
+
         attn_weights = torch.bmm(q, k.transpose(1, 2))
         attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
 

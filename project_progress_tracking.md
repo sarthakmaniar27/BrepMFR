@@ -2,7 +2,38 @@
 
 This file is a living analysis of the files involved in the **ONNX PyG inference (Thread + Text, 3-class)** workflow, how they interact, and the main goals of the system. It is updated whenever the inference scripts change.
 
-## 0. Latest update (2026-07-20) — fast A1+A3 dataset build (lite upgrade)
+## 0. Latest update (2026-07-20) — delta raw-JSON sync and clean no_a2 scratch run
+
+New state: `D:\thread_and_text\no_a2\pyg` has ~48k A1+A3 graphs, while `root_json` has ~70k JSONs. The additional ~22k JSONs have raw SolidWorks labels and no lite `.pt`, so the lite-upgrade path cannot process them. The 48k dataset must remain untouched; the expanded corpus is built under `D:\thread_and_text\no_a2_large`.
+
+**Implemented complete delta workflow:**
+
+| File | Role and interaction |
+|------|----------------------|
+| `scripts/threads/remap_missing_no_a2_json_labels.py` | Selects only JSON stems absent from `no_a2/pyg`, adds identity mappings for already-normalized targets, strictly audits unknown labels, then remaps `-10/-1/0→0`, `70→1`, `101→2`. Existing processed JSONs are untouched. |
+| `scripts/threads/prepare_no_a2_scratch_delta.ps1` | Two-phase orchestrator. Reads `BaseNoA2Root=no_a2`, targets `OutputRoot=no_a2_large`, and never writes the base. Without `-ApplyLabelRemap`, performs a no-write strict audit. With the switch, hard-link-seeds the new tree by default, remaps root+ABC deltas, converts, verifies coverage, rebuilds splits, recomputes weights, validates tensors, and quarantines unusable graphs. |
+| `scripts/inference/json_to_brepmfr_pyg_optimized.py` | Called without `--label_out_dir`, making `.pt` existence the sole skip condition. It scans all root JSONs cheaply, skips the ~48k files seeded into `no_a2_large`, and directly converts only missing stems using profile `no_a2`. |
+| `scripts/threads/make_random_splits.py` | Rebuilds train/val/test over the complete corpus; STEP variants remain atomic and the optional ABC ≥80% train quota remains available. |
+| `scripts/training/compute_class_weights.py` | Recomputes weights from the new train split because adding ~22k graphs changes class frequencies. |
+| `scripts/threads/validate_a1_a3_finetune_data.py` | Used without a lite reference because new JSON-only samples have no lite counterpart; validates split coverage, no_a2 tensors, and that every embedded label is in `[0, 2]`. |
+| `scripts/threads/train_no_a2_from_scratch.ps1` | Defaults to `no_a2_large` and its separately named class weights. Starts a unique 100-epoch run with no checkpoint flags, A1/A3 active at scale 1 from epoch 0, equal `0.002` LRs, warmup, length buckets, and A3 cap 768. |
+| `scripts/threads/README_thread_text.md` | Section 7 contains the exact dry-run, apply, and from-scratch training commands. |
+
+This differs from checkpoint recovery: splits and class weights are regenerated, no lite checkpoint is loaded, and no A1/A3 ramp is needed.
+
+**Progress visibility fix:** all long-running PowerShell workflow calls now use `conda run --no-capture-output`, so tqdm/indexing/training output streams immediately instead of appearing frozen until the child process exits. The delta remapper also prints before indexing the ~70k JSON and ~48k `.pt` directory entries.
+
+**Disk-full/remap-speed fix:** a copy-seeded `no_a2_large` began failing at `torch.save` with `PyTorchFileWriter ... cannot be opened` after many successful writes, consistent with the destination drive exhausting free space. The scratch preparer now defaults to hard-link seeding, supports `-ResetOutput` for deleting only the partial expanded tree, probes output writability, prints free space, and refuses conversion below `-MinFreeGB 20`. The JSON converter itself now aborts after three consecutive output-open failures and reports available space instead of printing thousands of identical failures. Delta label audit/remap is file-parallel (`-RemapWorkers`, default 8), uses `orjson` when available, performs atomic rewrites, and avoids a redundant pre-write scan after the orchestrator's strict audit. Root and ABC JSON directories are now both remapped, converted, and coverage-checked; ABC was previously used only during split generation.
+
+**Late validation recovery:** the expanded 72,223-graph run completed conversion, split generation, ABC allocation, and class-weight calculation but exposed legacy/unlabeled graphs only during final validation. The validator previously stopped after 20 errors, which could force repeated full runs and made its validated-count message misleading. It now always scans the complete split, reports the true valid/invalid totals, and supports `--quarantine-invalid`: all unusable `.pt` files are moved out of `pyg`, their stems are atomically removed from train/val/test and the ABC manifest, and a JSON report records every reason. Full scratch preparation enables this automatically; an already completed run can execute the validator once with this flag and proceed without repeating prior stages.
+
+**Cross-checkout compatibility fix:** training was launched from `Desktop\BrepMFR\brepmfr_pyg\BrepMFR` while development changes lived under `Desktop\BrepMFR_PyG\BrepMFR_PyG`. Its updated `segmentation.py` passed `max_nodes_for_a3` into a stale `CADSynth`, causing an immediate constructor error before any epoch. `scripts/threads/sync_a1_a3_training_code.ps1` now copies the complete coordinated set (entry point, dataset/collator, model/encoder/bias layer, and training wrapper), backs up target versions, compiles all synchronized Python files, and verifies required A1/A3 compatibility tokens.
+
+**AMP dtype fix:** after sync, sanity-check crashed in `GraphAttnBias` with `Index put requires the source and destination dtypes match, got Float for the destination and Half for the source` when expanding A3 edge features under `--precision 16-mixed`. The bias layer now allocates edge buffers via `new_zeros`, casts the indexed write and A1/A2/A3 additions to the destination dtype, and casts the float32 `a1_a3_scale` buffer before multiplying half activations. Re-run the sync script before restarting training.
+
+**Training throughput fix:** the first successful run exposed the real bottleneck: the legacy sampler assigned every graph above 300 faces to batch size 1, yielding 13,087 singleton large-graph batches and 16,995 total training batches per epoch. `LengthBucketBatchSampler` now supports a padded quadratic-cost budget (`batch_size × max_faces²`) and packs size-local graphs greedily while keeping the A3-enabled (`<= max_nodes_for_a3`) and A3-capped groups separate. Dense A1/A3 index tensors remain int32 through collation and host-to-device transfer, halving their traffic versus int64. The eight encoder layers now use PyTorch fused scaled-dot-product attention whenever weights are not requested; a numerical parity test against the legacy attention path showed maximum absolute error `1.79e-7`. The scratch wrapper defaults to a 4,000,000 node² budget, at most 64 graphs per batch, no redundant gradient accumulation, two DataLoader workers with prefetch two and pinned memory, TF32, no sanity-validation pass, a shorter 1,000-step warmup, and full validation every two epochs. Windows users can set workers to zero if commit memory or process spawning becomes unstable. This preserves full graphs and A1/A3 behavior while targeting step-count, transfer, and kernel-launch overhead—the dominant issues that Cython cannot improve in GPU attention training.
+
+## 0a. Prior update (2026-07-20) — fast A1+A3 dataset build (lite upgrade)
 
 Building `no_a2` (A1+A3) by re-running JSON→PyG was impractically slow (~15s/file → days for ~40–48k graphs). Root causes:
 

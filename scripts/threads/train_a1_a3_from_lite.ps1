@@ -69,7 +69,7 @@ Write-Host "  learning rates: backbone=1e-4, A1/A3=1e-3"
 Write-Host "  A3 cap: $MaxNodesForA3 faces (A1 remains active above the cap)"
 Write-Host ""
 
-& conda run -n $CondaEnv python @trainArgs
+& conda run --no-capture-output -n $CondaEnv python @trainArgs
 if ($LASTEXITCODE -ne 0) {
     throw "A1+A3 fine-tuning failed with exit code $LASTEXITCODE"
 }

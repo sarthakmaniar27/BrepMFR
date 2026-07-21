@@ -32,7 +32,7 @@ def _silence_known_third_party_warnings() -> None:
         "ignore",
         message=".*does not have many workers.*",
     )
-    # We intentionally omit persistent_workers on Windows (see data/dataset.py).
+    # Suppress Lightning's generic persistent-worker suggestion; this is controlled explicitly.
     warnings.filterwarnings(
         "ignore",
         message=r".*persistent_workers=True.*",
@@ -119,7 +119,10 @@ parser.add_argument(
     "--num_workers",
     type=int,
     default=12,
-    help="Number of workers for the dataloader. NOTE: set this to 0 on Windows, any other value leads to poor performance",
+    help=(
+        "DataLoader worker processes. On Windows start with 2 and prefetch_factor=2; "
+        "fall back to 0 if host commit memory is exhausted."
+    ),
 )
 parser.add_argument(
     "--pin_memory",
@@ -140,20 +143,51 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--persistent_workers",
+    action="store_true",
+    help=(
+        "Keep DataLoader worker processes alive across epochs. Recommended with "
+        "the bounded adaptive batch budget; disable if Windows commit memory is tight."
+    ),
+)
+parser.add_argument(
     "--length_bucket_batching",
     action="store_true",
     help=(
-        "Use a length-bucketed batch sampler: graphs with <=150 faces use --batch_size, "
-        "151-300 faces use batch_size//2, >300 faces use batch_size=1. Prevents OOM spikes "
-        "from O(N^2) attention on large graphs while keeping ALL training data (including "
-        "the 0.09%% of graphs with >500 faces). Recommended when training on mixed-size "
-        "BrepMFR data and hitting intermittent CUDA OOM at random epochs."
+        "Use size-aware batching. Without --batch_node_sq_budget this uses legacy "
+        "<=150/<=300/>300 buckets; with a budget it adaptively packs by padded N^2 cost."
+    ),
+)
+parser.add_argument(
+    "--batch_node_sq_budget",
+    type=int,
+    default=0,
+    metavar="N2",
+    help=(
+        "With --length_bucket_batching, greedily pack similar-size graphs while "
+        "batch_size * padded_max_nodes^2 <= N2. A value such as 4000000 replaces "
+        "the coarse >300-faces batch-size-1 rule and substantially reduces steps."
     ),
 )
 parser.add_argument(
     "--cuda_launch_blocking",
     action="store_true",
     help="Set CUDA_LAUNCH_BLOCKING=1 before training (CUDA debug only — large slowdown).",
+)
+parser.add_argument(
+    "--allow_tf32",
+    action="store_true",
+    help="Enable TF32 for remaining float32 CUDA matmuls (faster on Ampere/Hopper GPUs).",
+)
+parser.add_argument(
+    "--cudnn_benchmark",
+    action="store_true",
+    help="Let cuDNN autotune the fixed-size face/edge convolution kernels.",
+)
+parser.add_argument(
+    "--fused_adamw",
+    action="store_true",
+    help="Use PyTorch's fused CUDA AdamW implementation when available.",
 )
 parser.add_argument(
     "--checkpoint",
@@ -412,6 +446,13 @@ parser.add_argument(
     help="Lightning sanity validation batches before fit (2 default). Use 0 to skip if stuck after sanity.",
 )
 parser.add_argument(
+    "--check_val_every_n_epoch",
+    type=int,
+    default=1,
+    metavar="N",
+    help="Run full validation every N epochs (default: 1).",
+)
+parser.add_argument(
     "--tb_surrogate_trace",
     action="store_true",
     help=(
@@ -523,6 +564,14 @@ def main():
     # guard around training setup, every worker re-imports this module and tries to
     # restart training, eventually crashing in `_check_not_importing_main`.
     args = parser.parse_args()
+    if args.allow_tf32 and torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("CUDA TF32 enabled for float32 matmuls.", flush=True)
+    if args.cudnn_benchmark and torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        print("cuDNN convolution autotuning enabled.", flush=True)
     if args.pre_train and args.resume_from_checkpoint:
         parser.error("Use only one of --pre_train (fresh fine-tune state) or --resume_from_checkpoint (exact resume).")
     if args.learning_rate <= 0:
@@ -579,6 +628,7 @@ def main():
             filename="best",
             save_top_k=10,
             save_last=True,
+            every_n_epochs=max(1, int(args.check_val_every_n_epoch)),
         )
 
         callbacks = build_train_callbacks(
@@ -595,6 +645,10 @@ def main():
                 "spatial_pos_max": 32,
                 "pin_memory": bool(args.pin_memory),
                 "dataloader_prefetch_factor": args.dataloader_prefetch_factor,
+                "persistent_workers": bool(args.persistent_workers),
+                "batch_node_sq_budget": int(args.batch_node_sq_budget),
+                "fused_adamw": bool(args.fused_adamw),
+                "cudnn_benchmark": bool(args.cudnn_benchmark),
                 "accumulate_grad_batches": int(args.accumulate_grad_batches),
                 "precision": args.precision,
                 "max_graph_nodes": args.max_graph_nodes,
@@ -650,6 +704,8 @@ def main():
             gradient_clip_val=1.0,
             num_sanity_val_steps=int(args.num_sanity_val_steps),
             accumulate_grad_batches=int(args.accumulate_grad_batches),
+            check_val_every_n_epoch=max(1, int(args.check_val_every_n_epoch)),
+            benchmark=bool(args.cudnn_benchmark),
         )
         if args.precision != "32":
             tk["precision"] = args.precision
@@ -728,7 +784,9 @@ Best checkpoint:
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
             prefetch_factor=args.dataloader_prefetch_factor,
+            persistent_workers=args.persistent_workers,
             length_bucket_batching=args.length_bucket_batching,
+            batch_node_sq_budget=args.batch_node_sq_budget,
         )
         val_loader = val_data.get_dataloader(
             batch_size=args.batch_size,
@@ -736,7 +794,9 @@ Best checkpoint:
             num_workers=args.num_workers,
             pin_memory=args.pin_memory,
             prefetch_factor=args.dataloader_prefetch_factor,
+            persistent_workers=args.persistent_workers,
             length_bucket_batching=args.length_bucket_batching,
+            batch_node_sq_budget=args.batch_node_sq_budget,
         )
         if len(train_data) == 0:
             raise RuntimeError(

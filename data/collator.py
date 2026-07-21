@@ -89,7 +89,8 @@ def pad_attn_bias_unsqueeze(x, padlen):
     return x.unsqueeze(0)
 
 def pad_spatial_pos_unsqueeze(x, padlen):  # x[num_nodes, num_nodes]
-    x = x + 1
+    # int32 is accepted by nn.Embedding and halves pinned-memory/H2D traffic vs int64.
+    x = x.to(torch.int32) + 1
     xlen = x.size(0)
     if xlen < padlen:
         new_x = x.new_zeros([padlen, padlen], dtype=x.dtype)
@@ -114,7 +115,10 @@ def pad_ang_pos_unsqueeze(x, padlen): # x[num_nodes, num_nodes, 32]
     return x.unsqueeze(0)
      
 def pad_3d_unsqueeze(x, padlen1, padlen2, padlen3):  #x[num_nodes, num_nodes, max_dist]
-    xlen1, xlen2, xlen3 = x.size() 
+    # Keep dense A3 paths int32 until they reach the GPU; GraphAttnBias converts
+    # to int64 immediately before advanced indexing.
+    x = x.to(torch.int32)
+    xlen1, xlen2, xlen3 = x.size()
     if xlen1 < padlen1 or xlen2 < padlen2 or xlen3 < padlen3:
         new_x = -1 * x.new_ones([padlen1, padlen2, padlen3], dtype=x.dtype)
         new_x[:xlen1, :xlen2, :xlen3] = x
@@ -236,7 +240,7 @@ def collator(
     if run_batch_a3:
         edge_path = torch.cat(
             [pad_3d_unsqueeze(i, max_node_num, max_node_num, max_dist) for i in edge_paths]
-        ).long()
+        )
     else:
         edge_path = None
     
@@ -245,10 +249,10 @@ def collator(
     )
    
     if batch_has_a1:
-        # Graphs may store spatial_pos as uint8 on disk; nn.Embedding and masks expect int64.
+        # Graphs may store spatial_pos as uint8; keep int32 for lower H2D traffic.
         spatial_pos = torch.cat(
             [pad_spatial_pos_unsqueeze(i, max_node_num) for i in spatial_poses]
-        ).long()
+        )
     else:
         spatial_pos = None
 

@@ -86,15 +86,14 @@ def _dataloader_kw(
     *,
     prefetch_factor: int | None = None,
     pin_memory: bool = False,
+    persistent_workers: bool = False,
 ):
     # prefetch_factor capped low by default — raise via CLI (--dataloader_prefetch_factor)
     # if profiling shows idle GPU waiting on workers (watch RAM / page-file on Windows).
     kw = dict(num_workers=num_workers, drop_last=True, pin_memory=pin_memory)
     if num_workers > 0:
         kw["prefetch_factor"] = 1 if prefetch_factor is None else int(prefetch_factor)
-        # On Windows, persistent workers keep file mappings across epochs and often
-        # contribute to ERROR_COMMITMENT_LIMIT (1455) with huge collated batches.
-        kw["persistent_workers"] = os.name != "nt"
+        kw["persistent_workers"] = bool(persistent_workers)
     return kw
 
 
@@ -107,6 +106,7 @@ def _make_dataloader(
     *,
     prefetch_factor: int | None = None,
     pin_memory: bool = False,
+    persistent_workers: bool = False,
     batch_sampler=None,
 ):
     """Workers use torch ``DataLoader`` only (no stacked prefetch on Windows).
@@ -119,7 +119,10 @@ def _make_dataloader(
     because PyTorch forbids specifying them alongside a batch_sampler.
     """
     dl_kw = _dataloader_kw(
-        num_workers, prefetch_factor=prefetch_factor, pin_memory=pin_memory
+        num_workers,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
     if batch_sampler is not None:
         # batch_sampler is mutually exclusive with batch_size, shuffle, sampler,
@@ -254,7 +257,9 @@ class CADSynth(Dataset):
         print(f"Loading data...")
         list_path = _resolve_dataset_split_list(root_dir, filelist)
         with open(list_path, "r", encoding="utf-8") as f:
-            file_list = [x.strip() for x in f.readlines()]
+            # There can be 70k+ graph files. A set avoids an accidental
+            # O(files * split-size) scan from repeated membership checks.
+            file_list = {x.strip() for x in f if x.strip()}
         scan_root = _resolve_graph_pt_scan_root(root_dir, self.pt_subdir)
         if self.pt_subdir:
             print(f"  (--pt_subdir) scanning graphs under: {scan_root}")
@@ -346,7 +351,9 @@ class CADSynth(Dataset):
         num_workers=0,
         prefetch_factor=None,
         pin_memory=False,
+        persistent_workers: bool = False,
         length_bucket_batching: bool = False,
+        batch_node_sq_budget: Optional[int] = None,
     ):
         batch_sampler = None
         if length_bucket_batching:
@@ -361,6 +368,8 @@ class CADSynth(Dataset):
                 base_batch_size=batch_size,
                 shuffle=shuffle,
                 node_counts=node_counts,
+                node_sq_budget=batch_node_sq_budget,
+                a3_node_cap=self.max_nodes_for_a3,
             )
             print(
                 f"  total batches={len(batch_sampler)}",
@@ -374,6 +383,7 @@ class CADSynth(Dataset):
             num_workers,
             prefetch_factor=prefetch_factor,
             pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
             batch_sampler=batch_sampler,
         )
 
