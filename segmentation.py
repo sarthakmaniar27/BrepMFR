@@ -572,6 +572,12 @@ def main():
     if args.cudnn_benchmark and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         print("cuDNN convolution autotuning enabled.", flush=True)
+    if args.fused_adamw:
+        print(
+            "WARNING: fused AdamW requested; disabling Lightning gradient clipping "
+            "because AMP fused optimizers unscale gradients internally.",
+            flush=True,
+        )
     if args.pre_train and args.resume_from_checkpoint:
         parser.error("Use only one of --pre_train (fresh fine-tune state) or --resume_from_checkpoint (exact resume).")
     if args.learning_rate <= 0:
@@ -701,7 +707,9 @@ def main():
             logger=loggers,
             accelerator="gpu",
             devices=1,
-            gradient_clip_val=1.0,
+            # Lightning AMP cannot externally unscale/clip gradients for fused
+            # AdamW because that optimizer owns unscaling internally.
+            gradient_clip_val=0.0 if args.fused_adamw else 1.0,
             num_sanity_val_steps=int(args.num_sanity_val_steps),
             accumulate_grad_batches=int(args.accumulate_grad_batches),
             check_val_every_n_epoch=max(1, int(args.check_val_every_n_epoch)),

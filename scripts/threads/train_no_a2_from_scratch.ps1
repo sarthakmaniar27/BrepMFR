@@ -13,7 +13,7 @@ param(
     [int]$DataLoaderWorkers = 4,
     [int]$PrefetchFactor = 2,
     [bool]$PersistentWorkers = $true,
-    [bool]$FusedAdamW = $true,
+    [bool]$FusedAdamW = $false,
     [bool]$CudnnBenchmark = $false,
     [int]$LimitTrainBatches = 0,
     [string]$ResumeFromCheckpoint = ""

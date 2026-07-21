@@ -351,7 +351,7 @@ disable A3 for smaller graphs. This replaces the old `>300 faces -> batch size 1
 rule that produced ~17,000 batches per epoch. Dense A1/A3 indices transfer as int32
 instead of int64, and encoder self-attention uses PyTorch fused SDPA while preserving
 the additive Graphormer bias. The wrapper also enables pinned host memory, TF32 for
-remaining float32 CUDA kernels, fused AdamW, stable logits-based
+remaining float32 CUDA kernels, stable logits-based
 losses, and on-device validation aggregation. It removes sanity-validation steps,
 uses one optimizer step per packed batch, and runs full validation every two epochs.
 
