@@ -26,6 +26,7 @@ $relativeFiles = @(
     "models/modules/brep_encoder.py",
     "models/modules/layers/brep_encoder_layer.py",
     "models/modules/layers/multihead_attention.py",
+    "scripts/threads/train_a1_a3_from_lite.ps1",
     "scripts/threads/train_no_a2_from_scratch.ps1"
 )
 
@@ -88,6 +89,7 @@ $requiredTokens = @{
     "models/modules/brep_encoder.py" = @("max_nodes_for_a3")
     "models/modules/layers/brep_encoder_layer.py" = @("a1_a3_scale", "max_nodes_for_a3")
     "models/modules/layers/multihead_attention.py" = @("scaled_dot_product_attention")
+    "scripts/threads/train_a1_a3_from_lite.ps1" = @("ResumeFromCheckpoint", "BatchNodeSqBudget", "--allow_tf32")
 }
 foreach ($relative in $requiredTokens.Keys) {
     $content = Get-Content -LiteralPath (Join-Path $TargetRepo $relative) -Raw
