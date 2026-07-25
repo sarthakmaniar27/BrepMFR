@@ -1,0 +1,291 @@
+// ============================================================================
+// Job: Pipeline-Distribute-Filtered-Steps
+// ============================================================================
+// Copies filtered STEP keys onto agents' C:\abc_steps_filtered.
+//
+// IMPORTANT: SOURCE must be a shared STEP pool that every agent can READ
+// (UNC), NOT an empty local C:\abc_steps. Creating an empty local folder
+// does nothing — there are still no .step files to copy.
+//
+// Example shared pool (adjust to your real share):
+//   \\GR-SW65551\abc_steps
+//
+// Commit is SUCCESS-ONLY: keys that were MISSING / timed out / offline
+// stay in pending_keys.txt for the next wave.
+// ============================================================================
+
+def NODES = [
+    'GR-NAS',
+    'GR-SW26859',
+    'GR-SW26877',
+    'GR-SW34959',
+    'GR-SW36912',
+    // 'GR-SW41696',
+    'GR-SW43226',
+    // Offline / no Jenkins label — keep commented until the agent exists:
+    // 'GR-SW43701',
+    // 'GR-SW53252',
+    'GR-SW62363',
+    'GR-SW62366',
+    'GR-SW65237',
+    'GR-SW65700',
+    'GR-SW66732',
+    'GR-3240RTX3000',
+    'GR-HPZ2MINIG5',
+    'GR-SW41898',
+    'GR-SW44099',
+    'GR-SW44202',
+    'WALSWKQA19383',
+    'WALSWKQA19381',
+    'WALSWKQA19380',
+    'WALSWKQA19374',
+    'WALSWKQA19437',
+    'WALSWKQA19438',
+    'WALSWKQA19439',
+    'WALSWKQA19440',
+    'WALSWKQA19441',
+]
+
+def STATE_NODE = 'rza2-laptop'
+def STATE_DIR  = '\\\\GR-SW66464\\d\\thread_and_text\\pipeline_state'
+def SCRIPT_DIR = '\\\\GR-SW66464\\d\\thread_and_text\\pipeline_scripts'
+
+// Shared STEP pool (all agents must be able to read this).
+// Change if your canonical ABC STEPs live elsewhere.
+def SOURCE_DIR = '\\\\GR-SW65551\\abc_steps'
+def DEST_DIR   = 'C:\\abc_steps_filtered'
+
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        string(name: 'MAX_KEYS', defaultValue: '0', description: 'Cap keys this wave (0 = all pending)')
+        string(
+            name: 'SHARED_SOURCE',
+            defaultValue: '',
+            description: 'Override shared STEP source UNC (empty = use SOURCE_DIR in script)'
+        )
+        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Plan only; do not copy or commit')
+    }
+
+    stages {
+        stage('0 - Plan chunks on state node') {
+            agent { label "${STATE_NODE}" }
+            steps {
+                script {
+                    cleanWs()
+                    def maxKeys = params.MAX_KEYS?.trim() ?: '0'
+                    def dry = params.DRY_RUN ? '--dry-run' : ''
+
+                    def cleanedNodes = []
+                    for (nodeItem in NODES) {
+                        if (nodeItem != null && nodeItem.trim() != '') {
+                            cleanedNodes.add(nodeItem.trim())
+                        }
+                    }
+
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "NODES_LIST=${cleanedNodes.join(',')}",
+                        "MAX_KEYS=${maxKeys}",
+                        "OUT_DIR=${env.WORKSPACE}/chunks",
+                    ]) {
+                        powershell """
+                        \$ErrorActionPreference = 'Stop'
+                        New-Item -ItemType Directory -Force -Path "\$env:OUT_DIR" | Out-Null
+                        \$py = Join-Path \$env:SCRIPT_DIR 'plan_distribute_chunks.py'
+                        if (-not (Test-Path \$py)) {
+                            throw "Missing \$py — copy standalone_scripts/pipeline_dedup to \$env:SCRIPT_DIR"
+                        }
+                        \$nodes = \$env:NODES_LIST -split ','
+                        Write-Host "Planning distribute from \$env:STATE_DIR"
+                        python -u \$py --state-dir \$env:STATE_DIR --out-dir \$env:OUT_DIR --nodes @(\$nodes) --max-keys \$env:MAX_KEYS ${dry}
+                        """
+                    }
+
+                    if (params.DRY_RUN) {
+                        echo 'DRY_RUN: skipping stash/distribute/commit'
+                    } else {
+                        dir('chunks') {
+                            stash name: 'dist_chunks', includes: 'chunk_*.txt,distribute_manifest.json', allowEmpty: true
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('1 - Append-copy on each agent (from SHARED source)') {
+            when { expression { return !params.DRY_RUN } }
+            steps {
+                script {
+                    def branches = [:]
+                    def sourceDir = (params.SHARED_SOURCE?.trim()) ? params.SHARED_SOURCE.trim() : SOURCE_DIR
+
+                    def cleanedNodes = []
+                    for (nodeItem in NODES) {
+                        if (nodeItem != null && nodeItem.trim() != '') {
+                            cleanedNodes.add(nodeItem.trim())
+                        }
+                    }
+
+                    cleanedNodes.each { nodeName ->
+                        branches[nodeName] = {
+                            try {
+                                // Network copy of ~160 STEPs needs minutes, not 30s
+                                timeout(time: 45, unit: 'MINUTES') {
+                                    node(nodeName) {
+                                        cleanWs()
+                                        unstash 'dist_chunks'
+                                        withEnv([
+                                            "TARGET_NODE=${nodeName}",
+                                            "SOURCE_DIR=${sourceDir}",
+                                            "DEST_DIR=${DEST_DIR}",
+                                            "CHUNK_FILE=${env.WORKSPACE}/chunk_${nodeName}.txt",
+                                            "SUCCESS_FILE=${env.WORKSPACE}/success_${nodeName}.txt",
+                                        ]) {
+                                            powershell '''
+                                            $ErrorActionPreference = 'Stop'
+                                            $chunk  = $env:CHUNK_FILE
+                                            $source = $env:SOURCE_DIR
+                                            $dest   = $env:DEST_DIR
+                                            $successFile = $env:SUCCESS_FILE
+
+                                            if (-not (Test-Path $chunk)) {
+                                                Write-Host "No chunk file for $($env:TARGET_NODE) — skip"
+                                                Set-Content -Path $successFile -Value '' -Encoding UTF8
+                                                exit 0
+                                            }
+
+                                            $keys = @(Get-Content -Path $chunk | Where-Object {
+                                                $_.Trim() -ne '' -and -not $_.Trim().StartsWith('#')
+                                            } | ForEach-Object { $_.Trim().ToLowerInvariant() })
+
+                                            Write-Host "Node $($env:TARGET_NODE): $($keys.Count) keys in chunk"
+                                            Write-Host "Shared source: $source"
+                                            Write-Host "Local dest   : $dest"
+
+                                            if ($keys.Count -eq 0) {
+                                                Set-Content -Path $successFile -Value '' -Encoding UTF8
+                                                exit 0
+                                            }
+
+                                            if (-not (Test-Path $source)) {
+                                                throw "SHARED source not reachable on $($env:TARGET_NODE): $source. Do NOT use an empty local C:\\abc_steps."
+                                            }
+
+                                            if (-not (Test-Path $dest)) {
+                                                New-Item -ItemType Directory -Force -Path $dest | Out-Null
+                                            }
+
+                                            $allow = [System.Collections.Generic.HashSet[string]]::new([string[]]$keys)
+                                            $copied = 0
+                                            $exists = 0
+                                            $missing = 0
+                                            $okKeys = New-Object System.Collections.Generic.List[string]
+
+                                            Write-Host "Indexing shared source (this can take a while on large shares)..."
+                                            $steps = Get-ChildItem -Path $source -File -ErrorAction Stop | Where-Object {
+                                                $_.Extension -match '(?i)\\.(step|stp)$'
+                                            }
+
+                                            $byKey = @{}
+                                            foreach ($f in $steps) {
+                                                if ($f.BaseName -match '^(?<key>.+?_step_\\d+)') {
+                                                    $k = $Matches['key'].ToLowerInvariant()
+                                                    if ($allow.Contains($k) -and -not $byKey.ContainsKey($k)) {
+                                                        $byKey[$k] = $f
+                                                    }
+                                                }
+                                            }
+                                            Write-Host "Matched $($byKey.Count) / $($keys.Count) keys in shared source"
+
+                                            foreach ($k in $keys) {
+                                                $already = Get-ChildItem -Path $dest -File -ErrorAction SilentlyContinue |
+                                                    Where-Object {
+                                                        $_.Extension -match '(?i)\\.(step|stp)$' -and
+                                                        $_.BaseName -match '^(?<key>.+?_step_\\d+)' -and
+                                                        $Matches['key'].ToLowerInvariant() -eq $k
+                                                    } | Select-Object -First 1
+                                                if ($already) {
+                                                    $exists++
+                                                    $okKeys.Add($k)
+                                                    continue
+                                                }
+                                                if (-not $byKey.ContainsKey($k)) {
+                                                    Write-Warning "MISSING in shared source: $k"
+                                                    $missing++
+                                                    continue
+                                                }
+                                                $src = $byKey[$k]
+                                                Copy-Item -LiteralPath $src.FullName -Destination (Join-Path $dest $src.Name) -Force
+                                                $copied++
+                                                $okKeys.Add($k)
+                                            }
+
+                                            $okKeys | Sort-Object -Unique | Set-Content -Path $successFile -Encoding UTF8
+                                            $left = @(Get-ChildItem -Path $dest -File -ErrorAction SilentlyContinue | Where-Object {
+                                                $_.Extension -match '(?i)\\.(step|stp)$'
+                                            }).Count
+                                            Write-Host "==== $($env:TARGET_NODE): copied=$copied already=$exists missing=$missing success=$($okKeys.Count) filtered_now=$left ===="
+                                            '''
+                                        }
+                                        stash name: "success_${nodeName}", includes: "success_${nodeName}.txt", allowEmpty: true
+                                    }
+                                }
+                            } catch (Exception e) {
+                                echo "[${nodeName}] timed out, offline, or failed: ${e.message}. Keys stay in pending."
+                            }
+                        }
+                    }
+                    parallel branches
+                }
+            }
+        }
+
+        stage('2 - Commit SUCCESSFUL keys only') {
+            when { expression { return !params.DRY_RUN } }
+            agent { label "${STATE_NODE}" }
+            steps {
+                script {
+                    cleanWs()
+                    dir('success') {
+                        def cleanedNodes = []
+                        for (nodeItem in NODES) {
+                            if (nodeItem != null && nodeItem.trim() != '') {
+                                cleanedNodes.add(nodeItem.trim())
+                            }
+                        }
+                        cleanedNodes.each { n ->
+                            try {
+                                unstash "success_${n}"
+                            } catch (Exception e) {
+                                echo "No success stash for ${n}: ${e.message}"
+                            }
+                        }
+                    }
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "SUCCESS_DIR=${env.WORKSPACE}/success",
+                    ]) {
+                        powershell '''
+                        $ErrorActionPreference = 'Stop'
+                        $py = Join-Path $env:SCRIPT_DIR 'commit_successful_keys.py'
+                        if (-not (Test-Path $py)) {
+                            throw "Missing $py - copy commit_successful_keys.py to pipeline_scripts (or run Pipeline-Repair-Requeue-Distributed)"
+                        }
+                        python -u $py --state-dir $env:STATE_DIR --success-dir $env:SUCCESS_DIR
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

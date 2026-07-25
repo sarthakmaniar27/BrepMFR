@@ -356,7 +356,7 @@ def inference_thread_dataset(
                 correct += int((preds == gt_arr).sum())
                 all_preds.extend(preds.tolist())
                 all_labels.extend(gt_arr.tolist())
-            out_csv = inference_out / f"{pt_path.stem}.csv"
+            out_csv = inference_out / f"{pt_path.stem}_predictions.csv"
             write_thread_graph_csv(out_csv, pslice, num_classes, gt_arr)
             total_faces += n
             graphs_written += 1

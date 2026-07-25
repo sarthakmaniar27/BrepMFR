@@ -1,0 +1,2 @@
+graph,prediction_csv,faces,mean_confidence,class_counts,has_gt,status,error
+\\Gr-sw66464\D\thread_and_text\no_a2\pyg\00000000_engrave_102.pt,C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\test_a1_a3_onnx_out\00000000_engrave_102_predictions.csv,368,0.99998880,"Stock=15, Text=353",yes,PASS,

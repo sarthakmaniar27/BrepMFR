@@ -742,12 +742,14 @@ Best checkpoint:
 -----------------------------------------------------------------------------------
         """
         )
-        # if args.pre_train is not None:
-        #     model = BrepSeg.load_from_checkpoint(args.pre_train, args=args, strict=False)
-        # else:
-        #     model = BrepSeg(args)
-
-        model = BrepSeg(args)
+        if args.pre_train is not None:
+            pre_path = pathlib.Path(args.pre_train).expanduser().resolve()
+            if not pre_path.is_file():
+                raise FileNotFoundError(f"--pre_train checkpoint not found: {pre_path}")
+            print(f"Loading pre-trained weights from: {pre_path}")
+            model = BrepSeg.load_from_checkpoint(str(pre_path), args=args, strict=False)
+        else:
+            model = BrepSeg(args)
 
         # Stash a back-reference so the model can advance subgraph_epoch each epoch
         # (gives different random crops of the same part across epochs when using

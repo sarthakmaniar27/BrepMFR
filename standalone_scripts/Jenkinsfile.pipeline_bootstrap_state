@@ -1,0 +1,182 @@
+// ============================================================================
+// Job: Pipeline-Bootstrap-State-Machine (ONE-TIME / IDEMPOTENT)
+// ============================================================================
+// Runs on GR-SW66464 and:
+//   1) Creates D:\thread_and_text\pipeline_state
+//   2) Creates D:\thread_and_text\pipeline_scripts
+//   3) Copies standalone_scripts/pipeline_dedup/*.py into pipeline_scripts
+//   4) Seeds stage2_done_keys.txt from D:\thread_and_text\abc_json
+//
+// How to load the scripts onto the agent:
+//   Prefer: Pipeline from SCM (this repo) so checkout puts pipeline_dedup in WORKSPACE.
+//   Or set SCRIPT_SOURCE to a path already on the machine / a share.
+//
+// Safe to re-run: seed merges into the done ledger (does not wipe other ledgers).
+// ============================================================================
+
+def STATE_NODE = 'GR-SW66464'
+def STATE_DIR = 'D:\\thread_and_text\\pipeline_state'
+def SCRIPT_DIR = 'D:\\thread_and_text\\pipeline_scripts'
+def DONE_JSON_DIR = 'D:\\thread_and_text\\abc_json'
+
+pipeline {
+    agent { label "${STATE_NODE}" }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        // Keep checkout ON if the job is "Pipeline script from SCM".
+        // If you paste this Jenkinsfile without SCM, set CHECKOUT_SCM=false and
+        // provide SCRIPT_SOURCE (path that already contains the .py files).
+    }
+
+    parameters {
+        booleanParam(
+            name: 'CHECKOUT_SCM',
+            defaultValue: true,
+            description: 'Checkout this job\'s SCM into the workspace (recommended).'
+        )
+        string(
+            name: 'SCRIPT_SOURCE',
+            defaultValue: '',
+            description: 'Optional override folder containing pipeline_dedup *.py (if empty, uses workspace checkout).'
+        )
+        booleanParam(
+            name: 'REPLACE_DONE_LEDGER',
+            defaultValue: false,
+            description: 'If true, overwrite stage2_done_keys.txt instead of merging.'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: false,
+            description: 'Print actions only; do not copy or seed.'
+        )
+    }
+
+    stages {
+        stage('0 - Optional SCM checkout') {
+            when { expression { return params.CHECKOUT_SCM } }
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('1 - Create folders + copy scripts') {
+            steps {
+                script {
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "DONE_JSON_DIR=${DONE_JSON_DIR}",
+                        "SCRIPT_SOURCE=${params.SCRIPT_SOURCE?.trim() ?: ''}",
+                        "WORKSPACE_DIR=${env.WORKSPACE}",
+                        "DRY=${params.DRY_RUN ? '1' : '0'}",
+                    ]) {
+                        powershell '''
+                        $ErrorActionPreference = 'Stop'
+                        $dry = $env:DRY -eq '1'
+
+                        Write-Host "State dir : $env:STATE_DIR"
+                        Write-Host "Script dir: $env:SCRIPT_DIR"
+                        Write-Host "JSON dir  : $env:DONE_JSON_DIR"
+                        Write-Host "Workspace : $env:WORKSPACE_DIR"
+                        Write-Host "Override  : $env:SCRIPT_SOURCE"
+
+                        $src = $null
+                        if ($env:SCRIPT_SOURCE -and (Test-Path $env:SCRIPT_SOURCE)) {
+                            $src = $env:SCRIPT_SOURCE
+                        } else {
+                            $candidates = @(
+                                (Join-Path $env:WORKSPACE_DIR 'standalone_scripts\\pipeline_dedup'),
+                                (Join-Path $env:WORKSPACE_DIR 'pipeline_dedup'),
+                                (Join-Path $env:WORKSPACE_DIR 'BrepMFR_PyG\\standalone_scripts\\pipeline_dedup')
+                            )
+                            foreach ($c in $candidates) {
+                                if (Test-Path (Join-Path $c 'seed_stage2_done_keys.py')) {
+                                    $src = $c
+                                    break
+                                }
+                            }
+                        }
+
+                        if (-not $src) {
+                            throw @"
+Cannot find pipeline_dedup scripts.
+- Enable CHECKOUT_SCM on a job that points at this repo, OR
+- Set SCRIPT_SOURCE to a folder that contains seed_stage2_done_keys.py
+"@
+                        }
+
+                        Write-Host "Using script source: $src"
+                        $needed = @(
+                            'key_utils.py',
+                            'seed_stage2_done_keys.py',
+                            'enqueue_filtered_keys.py',
+                            'plan_distribute_chunks.py',
+                            'append_steps_from_allowlist.py',
+                            'cleanup_agent_filtered.py',
+                            'merge_harvested_done_keys.py'
+                        )
+                        foreach ($f in $needed) {
+                            if (-not (Test-Path (Join-Path $src $f))) {
+                                throw "Missing required file in source: $f"
+                            }
+                        }
+
+                        if ($dry) {
+                            Write-Host "[DRY-RUN] Would create $env:STATE_DIR"
+                            Write-Host "[DRY-RUN] Would create $env:SCRIPT_DIR"
+                            Write-Host "[DRY-RUN] Would copy *.py from $src -> $env:SCRIPT_DIR"
+                            exit 0
+                        }
+
+                        New-Item -ItemType Directory -Force -Path $env:STATE_DIR | Out-Null
+                        New-Item -ItemType Directory -Force -Path $env:SCRIPT_DIR | Out-Null
+                        Copy-Item -Path (Join-Path $src '*.py') -Destination $env:SCRIPT_DIR -Force
+                        Write-Host "[OK] Copied scripts:"
+                        Get-ChildItem -Path $env:SCRIPT_DIR -Filter *.py | ForEach-Object { Write-Host "  $($_.Name)" }
+
+                        if (-not (Test-Path $env:DONE_JSON_DIR)) {
+                            throw "Done JSON folder not found: $env:DONE_JSON_DIR"
+                        }
+                        $n = @(Get-ChildItem -Path $env:DONE_JSON_DIR -Filter *.json -File -ErrorAction SilentlyContinue).Count
+                        Write-Host "[OK] Found $n JSON files under $env:DONE_JSON_DIR"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('2 - Seed stage2_done_keys') {
+            when { expression { return !params.DRY_RUN } }
+            steps {
+                script {
+                    def replaceFlag = params.REPLACE_DONE_LEDGER ? '--replace' : ''
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "DONE_JSON_DIR=${DONE_JSON_DIR}",
+                    ]) {
+                        powershell """
+                        \$ErrorActionPreference = 'Stop'
+                        \$py = Join-Path \$env:SCRIPT_DIR 'seed_stage2_done_keys.py'
+                        if (-not (Test-Path \$py)) { throw "Missing \$py" }
+                        Write-Host "Seeding done ledger from \$env:DONE_JSON_DIR"
+                        python \$py --json-dir \$env:DONE_JSON_DIR --state-dir \$env:STATE_DIR ${replaceFlag}
+                        Write-Host "---- ledger files ----"
+                        Get-ChildItem -Path \$env:STATE_DIR -File | ForEach-Object {
+                            Write-Host ("  {0}  ({1} bytes)" -f \$_.Name, \$_.Length)
+                        }
+                        """
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Bootstrap complete on ${STATE_NODE}. Ledgers under ${STATE_DIR}; scripts under ${SCRIPT_DIR}."
+        }
+    }
+}

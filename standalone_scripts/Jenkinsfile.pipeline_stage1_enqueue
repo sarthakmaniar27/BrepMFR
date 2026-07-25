@@ -1,0 +1,122 @@
+// ============================================================================
+// Job: Pipeline-Stage1-Infer-And-Enqueue
+// ============================================================================
+// Hourly Stage-1 producer (runs on the inference / JSON machine):
+//   1) ONNX inference on new JSONs only (--skip-existing)
+//   2) Export allowlist of no-Thread/Text STEP keys
+//   3) Enqueue NEW keys into central pending ledger (dedup vs done/distributed/pending)
+//
+// This job does NOT distribute files and does NOT run the Stage-2 CLI.
+// Pair with:
+//   Pipeline-Distribute-Filtered-Steps  (every ~15 min)
+//   Pipeline-Cleanup-Stage2-Filtered    (hourly)
+//
+// IMPORTANT:
+//   - STATE_DIR must be reachable from this agent (local D: if this IS GR-SW66464,
+//     or a mapped/UNC path you configure below).
+//   - Adjust INFER_NODE / JSON_DIR / conda env to match your setup.
+// ============================================================================
+
+def INFER_NODE = 'GR-SW66464'   // change if inference runs elsewhere
+def STATE_DIR = 'D:\\thread_and_text\\pipeline_state'
+def SCRIPT_DIR = 'D:\\thread_and_text\\pipeline_scripts'
+def JSON_DIR = 'C:\\jsons'
+def REPO_OR_SCRIPTS = 'D:\\thread_and_text\\brepmfr_scripts' // copy of repo standalone_scripts parent OR full repo
+def CONDA_ENV = 'brep_mfr_pyg'
+
+pipeline {
+    agent { label "${INFER_NODE}" }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_INFERENCE', defaultValue: true,
+                     description: 'Run ONNX batch inference before enqueue')
+        booleanParam(name: 'STAGE2_ONLY', defaultValue: false,
+                     description: 'Re-filter existing CSVs only (no new inference)')
+        string(name: 'MAX_NEW_KEYS', defaultValue: '0',
+               description: 'Cap newly enqueued keys this run (0 = no cap)')
+        booleanParam(name: 'DRY_RUN', defaultValue: false)
+    }
+
+    stages {
+        stage('1 - Inference / Stage-2 filter') {
+            when { expression { return params.RUN_INFERENCE } }
+            steps {
+                script {
+                    def extra = params.STAGE2_ONLY ? '--stage2-only' : '--skip-existing'
+                    withEnv([
+                        "JSON_DIR=${JSON_DIR}",
+                        "REPO=${REPO_OR_SCRIPTS}",
+                        "CONDA_ENV=${CONDA_ENV}",
+                        "EXTRA=${extra}",
+                    ]) {
+                        powershell '''
+                        $ErrorActionPreference = 'Stop'
+                        $infer = Join-Path $env:REPO 'standalone_scripts\\run_onnx_json_batch_inference.py'
+                        if (-not (Test-Path $infer)) {
+                            # allow REPO to point directly at standalone_scripts
+                            $infer = Join-Path $env:REPO 'run_onnx_json_batch_inference.py'
+                        }
+                        if (-not (Test-Path $infer)) {
+                            throw "Cannot find run_onnx_json_batch_inference.py under $env:REPO"
+                        }
+                        Write-Host "Running: $infer --json-dir $env:JSON_DIR $env:EXTRA"
+                        conda run -n $env:CONDA_ENV python $infer --json-dir $env:JSON_DIR $env:EXTRA.Split(' ')
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('2 - Export allowlist') {
+            steps {
+                script {
+                    withEnv(["JSON_DIR=${JSON_DIR}", "REPO=${REPO_OR_SCRIPTS}"]) {
+                        powershell '''
+                        $ErrorActionPreference = 'Stop'
+                        $export = Join-Path $env:REPO 'standalone_scripts\\export_step_allowlist_from_inference.py'
+                        if (-not (Test-Path $export)) {
+                            $export = Join-Path $env:REPO 'export_step_allowlist_from_inference.py'
+                        }
+                        if (-not (Test-Path $export)) {
+                            throw "Cannot find export_step_allowlist_from_inference.py under $env:REPO"
+                        }
+                        python $export --txt (Join-Path $env:JSON_DIR 'inference\\no_confident_thread_or_text.txt') `
+                                       --csv (Join-Path $env:JSON_DIR 'inference\\no_confident_thread_or_text.csv') `
+                                       --out (Join-Path $env:JSON_DIR 'inference\\allowed_step_keys.txt')
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('3 - Enqueue new keys (dedup)') {
+            steps {
+                script {
+                    def maxNew = params.MAX_NEW_KEYS?.trim() ?: '0'
+                    def dry = params.DRY_RUN ? '--dry-run' : ''
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "ALLOW=${JSON_DIR}\\inference\\allowed_step_keys.txt",
+                        "MAX_NEW=${maxNew}",
+                    ]) {
+                        powershell """
+                        \$ErrorActionPreference = 'Stop'
+                        \$py = Join-Path \$env:SCRIPT_DIR 'enqueue_filtered_keys.py'
+                        if (-not (Test-Path \$py)) {
+                            throw "Missing \$py — copy standalone_scripts/pipeline_dedup to \$env:SCRIPT_DIR"
+                        }
+                        python \$py --allowlist \$env:ALLOW --state-dir \$env:STATE_DIR --max-new \$env:MAX_NEW ${dry}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}

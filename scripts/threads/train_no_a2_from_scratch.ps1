@@ -16,7 +16,8 @@ param(
     [bool]$FusedAdamW = $false,
     [bool]$CudnnBenchmark = $false,
     [int]$LimitTrainBatches = 0,
-    [string]$ResumeFromCheckpoint = ""
+    [string]$ResumeFromCheckpoint = "",
+    [string]$PreTrain = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -85,15 +86,25 @@ if ($CudnnBenchmark) {
 if ($LimitTrainBatches -gt 0) {
     $trainArgs += @("--limit_train_batches", [string]$LimitTrainBatches)
 }
+if ($ResumeFromCheckpoint -and $PreTrain) {
+    throw "Specify only one of -ResumeFromCheckpoint or -PreTrain."
+}
 if ($ResumeFromCheckpoint) {
     if (-not (Test-Path $ResumeFromCheckpoint -PathType Leaf)) {
         throw "Resume checkpoint not found: $ResumeFromCheckpoint"
     }
     $trainArgs += @("--resume_from_checkpoint", $ResumeFromCheckpoint)
+} elseif ($PreTrain) {
+    if (-not (Test-Path $PreTrain -PathType Leaf)) {
+        throw "PreTrain checkpoint not found: $PreTrain"
+    }
+    $trainArgs += @("--pre_train", $PreTrain)
 }
 
 if ($ResumeFromCheckpoint) {
-    Write-Host "Resuming the existing A1+A3 training run."
+    Write-Host "Resuming existing A1+A3 training run (continuing epoch & optimizer state)."
+} elseif ($PreTrain) {
+    Write-Host "Starting new training run initialized from pre-trained weights (epoch 0)."
 } else {
     Write-Host "Starting a completely new A1+A3 training run."
 }
@@ -107,7 +118,7 @@ Write-Host "  validation:    every $CheckValEveryNEpoch epoch(s)"
 if ($LimitTrainBatches -gt 0) { Write-Host "  benchmark cap: $LimitTrainBatches train batches/epoch" }
 Write-Host "  data loading:  $DataLoaderWorkers worker(s), prefetch=$PrefetchFactor, pinned memory, persistent=$PersistentWorkers"
 Write-Host "  CUDA fast path: fused AdamW=$FusedAdamW, cuDNN benchmark=$CudnnBenchmark, TF32=true"
-Write-Host "  checkpoint:    $(if ($ResumeFromCheckpoint) { $ResumeFromCheckpoint } else { 'none (training from scratch)' })"
+Write-Host "  checkpoint:    $(if ($ResumeFromCheckpoint) { "exact resume ($ResumeFromCheckpoint)" } elseif ($PreTrain) { "pre-train weights ($PreTrain)" } else { "none (training from scratch)" })"
 Write-Host ""
 
 & conda run --no-capture-output -n $CondaEnv python @trainArgs

@@ -11,7 +11,7 @@ param(
     [int]$BatchNodeSqBudget = 4000000,
     [int]$AccumulateGradBatches = 1,
     [int]$OptimizerWarmupSteps = 1000,
-    [int]$CheckValEveryNEpoch = 2,
+    [int]$CheckValEveryNEpoch = 0,
     [int]$DataLoaderWorkers = 4,
     [int]$PrefetchFactor = 2,
     [bool]$PersistentWorkers = $true,
@@ -28,6 +28,15 @@ $HasLiteCheckpoint = -not [string]::IsNullOrWhiteSpace($Checkpoint)
 $HasResumeCheckpoint = -not [string]::IsNullOrWhiteSpace($ResumeFromCheckpoint)
 if ($HasLiteCheckpoint -eq $HasResumeCheckpoint) {
     throw "Specify exactly one of -Checkpoint (fresh fine-tune from lite weights) or -ResumeFromCheckpoint (exact training resume)."
+}
+
+if ($CheckValEveryNEpoch -lt 0) {
+    throw "CheckValEveryNEpoch must be non-negative (0 selects the safe mode-specific default)."
+}
+if ($CheckValEveryNEpoch -eq 0) {
+    # Legacy fine-tune checkpoints used every_n_epochs=1; matching it restores
+    # ModelCheckpoint state as well as the model/optimizer/loop state.
+    $CheckValEveryNEpoch = if ($HasResumeCheckpoint) { 1 } else { 2 }
 }
 
 if ($HasResumeCheckpoint) {

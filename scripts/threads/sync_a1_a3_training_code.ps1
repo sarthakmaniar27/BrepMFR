@@ -88,7 +88,7 @@ $requiredTokens = @{
     "models/tensorboard_media.py" = @("log_segmentation_val_confusion")
     "models/modules/brep_encoder.py" = @("max_nodes_for_a3")
     "models/modules/layers/brep_encoder_layer.py" = @("a1_a3_scale", "max_nodes_for_a3")
-    "models/modules/layers/multihead_attention.py" = @("scaled_dot_product_attention")
+    "models/modules/layers/multihead_attention.py" = @("scaled_dot_product_attention", "q = q * self.scaling")
     "scripts/threads/train_a1_a3_from_lite.ps1" = @("ResumeFromCheckpoint", "BatchNodeSqBudget", "--allow_tf32")
 }
 foreach ($relative in $requiredTokens.Keys) {
@@ -100,6 +100,17 @@ foreach ($relative in $requiredTokens.Keys) {
     }
 }
 
+$forbiddenTokens = @{
+    "models/modules/layers/multihead_attention.py" = @("q *= self.scaling")
+}
+foreach ($relative in $forbiddenTokens.Keys) {
+    $content = Get-Content -LiteralPath (Join-Path $TargetRepo $relative) -Raw
+    foreach ($token in $forbiddenTokens[$relative]) {
+        if ($content.Contains($token)) {
+            throw "Compatibility verification failed: $relative still contains forbidden '$token'."
+        }
+    }
+}
 Write-Host ""
 Write-Host "A1/A3 training-code synchronization passed."
 Write-Host "The previous target files are preserved under: $backupRoot"
