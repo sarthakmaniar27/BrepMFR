@@ -76,7 +76,7 @@ $trainArgs = @(
     "segmentation.py", "train",
     "--dataset_path", $DatasetRoot,
     "--pt_subdir", "pyg",
-    "--num_classes", "5",
+    "--num_classes", "3",
     "--batch_size", [string]$BatchSize,
     "--batch_node_sq_budget", [string]$BatchNodeSqBudget,
     "--accumulate_grad_batches", [string]$AccumulateGradBatches,

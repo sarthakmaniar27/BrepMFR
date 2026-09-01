@@ -1,0 +1,79 @@
+// ============================================================================
+// Job: Pipeline-Repair-Requeue-Distributed (ONE-SHOT)
+// ============================================================================
+// Fixes a bad distribute commit where pending became 0 and distributed=4339
+// even though most STEPs were never copied.
+//
+// Also copies any newer pipeline_dedup *.py from SCRIPT_SOURCE into SCRIPT_DIR
+// (so commit_successful_keys.py / requeue_distributed_keys.py are present).
+// ============================================================================
+
+def STATE_NODE = 'rza2-laptop'
+def STATE_DIR  = '\\\\GR-SW66464\\d\\thread_and_text\\pipeline_state'
+def SCRIPT_DIR = '\\\\GR-SW66464\\d\\thread_and_text\\pipeline_scripts'
+
+pipeline {
+    agent { label "${STATE_NODE}" }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+    }
+
+    parameters {
+        string(
+            name: 'SCRIPT_SOURCE',
+            defaultValue: 'C:\\Users\\RZA2\\Desktop\\BrepMFR_PyG\\BrepMFR_PyG\\standalone_scripts\\pipeline_dedup',
+            description: 'Local folder with latest pipeline_dedup *.py'
+        )
+        booleanParam(name: 'DRY_RUN', defaultValue: false)
+    }
+
+    stages {
+        stage('1 - Sync scripts to share') {
+            steps {
+                script {
+                    withEnv([
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "SCRIPT_SOURCE=${params.SCRIPT_SOURCE?.trim() ?: ''}",
+                    ]) {
+                        powershell '''
+                        $ErrorActionPreference = 'Stop'
+                        if (-not (Test-Path $env:SCRIPT_SOURCE)) {
+                            throw "SCRIPT_SOURCE not found: $env:SCRIPT_SOURCE"
+                        }
+                        New-Item -ItemType Directory -Force -Path $env:SCRIPT_DIR | Out-Null
+                        Copy-Item -Path (Join-Path $env:SCRIPT_SOURCE '*.py') -Destination $env:SCRIPT_DIR -Force
+                        Write-Host "[OK] Synced scripts:"
+                        Get-ChildItem $env:SCRIPT_DIR -Filter *.py | ForEach-Object { Write-Host "  $($_.Name)" }
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('2 - Requeue distributed -> pending') {
+            steps {
+                script {
+                    def dry = params.DRY_RUN ? '--dry-run' : ''
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                    ]) {
+                        powershell """
+                        \$ErrorActionPreference = 'Stop'
+                        \$py = Join-Path \$env:SCRIPT_DIR 'requeue_distributed_keys.py'
+                        if (-not (Test-Path \$py)) { throw "Missing \$py" }
+                        python -u \$py --state-dir \$env:STATE_DIR ${dry}
+                        Write-Host '---- ledger sizes ----'
+                        Get-ChildItem -Path \$env:STATE_DIR -File | ForEach-Object {
+                            Write-Host ("  {0}  ({1} bytes)" -f \$_.Name, \$_.Length)
+                        }
+                        """
+                    }
+                }
+            }
+        }
+    }
+}

@@ -2,6 +2,488 @@
 
 This file is a living analysis of the files involved in the **ONNX PyG inference (Thread + Text, 3-class)** workflow, how they interact, and the main goals of the system. It is updated whenever the inference scripts change.
 
+## 0. Latest update (2026-07-25) — Stock summarize CSV name mismatch
+
+### Bug
+
+`run_thread_pyg_inference.py` wrote `{stem}.csv`, while
+`summarize_stock_only_inference.py` only globbed `*_predictions.csv` → false
+"no csv found" even when per-graph CSVs existed.
+
+### Fix
+
+- Summarizer accepts `*_predictions.csv` or plain `{stem}.csv` (skips metrics).
+- Inference writer now emits `{stem}_predictions.csv` for new runs.
+
+## 0. Prior update (2026-07-24) — Rewrite approved-list JSON roots
+
+### Problem
+
+Approved list paths pointed at `C:\jsons\*.json` but files live under
+`D:\thread_and_text\stock_abc_json`.
+
+### Fix
+
+`scripts/threads/rewrite_approved_json_paths.ps1` — keeps filenames, swaps root,
+writes `*_rewritten.txt`, verifies files exist unless `-SkipExistsCheck`.
+
+## 0. Prior update (2026-07-24) — prepare_new_abc_finetune_data.ps1 -Apply
+
+### What `-Apply` does
+
+1. Writes Stock JSON copies from `$ApprovedList` → `$StockJsonDir` (needs
+   `-OverwriteStockJsons` if Option B already filled that dir).
+2. Calls `prepare_no_a2_scratch_delta.ps1` to build `$CombinedNoA2Root`:
+   seed old `.pt`, remap+convert new/Stock JSONs, splits, class weights, validate.
+
+Dry-run (no `-Apply`) only audits Stock list + remappable labels in the 25K folder.
+
+## 0. Prior update (2026-07-24) — Path variable origins for finetune prep
+
+| Variable | How you get it |
+|----------|----------------|
+| `$ApprovedList` | Already have: `C:\jsons\inference\no_confident_thread_or_text.txt` |
+| `$IdentityMap` | Already in repo: `scripts/threads/remap_maps/thread_text_sw_to_brep_with_identity.json` |
+| `$CombinedNoA2` | **Output dir** created by `prepare_new_abc_finetune_data.ps1 -Apply` |
+| `$ClassWeights` | **Output file** written by same prep (via `compute_class_weights.py`) |
+
+Do not create Combined/class-weights by hand; run the preparer.
+
+## 0. Prior update (2026-07-24) — After STEP allowlist export → Stock JSON Option B
+
+### Status
+
+User ran `standalone_scripts/export_step_allowlist_from_inference.py`, which wrote
+STEP-key allowlists (`allowed_step_keys*.txt`, ~5128 keys). That is for Stage-2
+STEP filtering / distribute — **not** Stock JSON creation.
+
+Approved JSON path list already exists:
+`C:\jsons\inference\no_confident_thread_or_text.txt` (~5128 absolute `.json` paths).
+
+### Next (Option B)
+
+1. Dry-run `prepare_approved_abc_stock_jsons.py` (no `--write`).
+2. Apply with `--write` → `$StockJson` + `stock_label_manifest.csv`.
+3. Then continue combined-dataset prep (`prepare_new_abc_finetune_data.ps1`).
+
+## 0. Prior update (2026-07-24) — StockJson is generated, not pre-existing
+
+### Clarification
+
+`$StockJson` (`approved_abc_stock_json`) is an **output** of
+`prepare_approved_abc_stock_jsons.py`. Inputs are only:
+
+1. `C:\jsons\*.json` (or whatever paths the approved list points at)
+2. `C:\jsons\inference\no_confident_thread_or_text.txt`
+
+The script copies each approved path to `$StockJson` and sets every face label
+to `0`. It never edits `C:\jsons`. Do not manually filter the whole JSON root
+into Stock.
+
+## 0. Prior update (2026-07-24) — New ABC fine-tune data preparation
+
+### Main goal
+
+Combine three sources into one training-ready `no_a2` dataset for fine-tuning the
+72K Thread/Text classifier (classes `0=Stock`, `1=Thread`, `2=Text`):
+
+1. Existing ~72K `no_a2` PyG graphs (seeded, not modified).
+2. ~25K synthetic ABC JSONs with Thread/Text labels.
+3. ~4,834 approved original ABC JSONs (no confident Thread/Text) pseudo-labeled
+   entirely as Stock=`0`.
+
+Operator guide: `training_on_new_abc_document.md`.
+
+### File roles and interactions
+
+```text
+ApprovedList (no_confident_thread_or_text.txt)
+        |
+        v
+prepare_approved_abc_stock_jsons.py  -->  StockJson/*.json + stock_label_manifest.csv
+        |
+New25KJson + StockJson + OldNoA2/pyg
+        |
+        v
+prepare_new_abc_finetune_data.ps1  (wrapper)
+        |
+        v
+prepare_no_a2_scratch_delta.ps1
+  -> seed old .pt (HardLink/Copy)
+  -> remap new labels (identity map)
+  -> json_to_brepmfr_pyg_optimized.py (no_a2)
+  -> make_random_splits.py (_step_NNN families)
+  -> compute_class_weights.py
+  -> validate_a1_a3_finetune_data.py
+        |
+        v
+CombinedNoA2/{pyg, train.txt, val.txt, test.txt}
+        |
+        v
+make_stock_only_eval_split.py  -->  stock_only_test.txt (fixed eval)
+```
+
+| File | Role |
+|------|------|
+| `training_on_new_abc_document.md` | End-to-end prep + fine-tune + Stock→Text eval. |
+| `scripts/threads/prepare_approved_abc_stock_jsons.py` | Audit approved list; write Stock-only JSON copies (never edits `C:\jsons`). |
+| `scripts/threads/prepare_new_abc_finetune_data.ps1` | Operator wrapper: dry-run or `-Apply` full build. |
+| `scripts/threads/prepare_no_a2_scratch_delta.ps1` | Underlying seed/remap/convert/split/weights/validate. |
+| `scripts/inference/json_to_brepmfr_pyg_optimized.py` | JSON → PyG with `--inference_profile no_a2`. |
+| `scripts/threads/make_random_splits.py` | STEP-key-aware 80/10/10 splits. |
+| `scripts/training/compute_class_weights.py` | Weights from new train split. |
+| `scripts/threads/validate_a1_a3_finetune_data.py` | Labels `[0,2]`, A1/A3 tensors, quarantine. |
+| `scripts/threads/make_stock_only_eval_split.py` | Untouched Stock originals in val/test. |
+| `scripts/threads/remap_maps/thread_text_sw_to_brep_with_identity.json` | Remap map for 25K labels. |
+
+### Critical constraints
+
+- Only paths in `C:\jsons\inference\no_confident_thread_or_text.txt` become Stock.
+- Filenames must keep `_step_NNN` so families stay atomic across splits.
+- Dry-run before `-Apply`; use HardLink when old+combined share an NTFS volume.
+
+## 0. Prior update (2026-07-23) — Repair requeue after bad distribute commit
+
+### Problem
+
+First distribute run committed all pending keys (`distributed=4339`, `pending=0`)
+even when most agents had empty/missing local STEP sources. Next distribute then
+had nothing to ship.
+
+### Fix files
+
+| File | Role |
+|------|------|
+| `pipeline_dedup/requeue_distributed_keys.py` | Move distributed → pending; clear distributed. |
+| `Jenkinsfile.pipeline_repair_requeue` | Sync `*.py` to share + run requeue. |
+| `pipeline_dedup/commit_successful_keys.py` | Must exist on share before success-only commit. |
+
+### Operator steps
+
+1. Run `Pipeline-Repair-Requeue-Distributed` once (syncs scripts + requeues).
+2. Re-run distribute with shared UNC source (`\\GR-SW65551\abc_steps`).
+
+## 0. Prior update (2026-07-23) — Shared STEP source + success-only commit
+
+### Main goal
+
+Fix distribute for agents that have **no local** `C:\abc_steps`: copy from a
+shared UNC STEP pool into each agent's `C:\abc_steps_filtered`, and only mark
+keys distributed when copy/already-present succeeded.
+
+### Files
+
+| File | Role |
+|------|------|
+| `Jenkinsfile.pipeline_distribute_only` | `SOURCE_DIR` = shared UNC; 45m timeout; success stash per node. |
+| `pipeline_dedup/commit_successful_keys.py` | Commit only `success_*.txt` keys; leave missing in pending. |
+| `CONTINUOUS_PIPELINE.md` | Documents “empty C:\\abc_steps” anti-pattern. |
+
+## 0. Prior update (2026-07-23) — Bootstrap state machine via Jenkins
+
+### Main goal
+
+Allow the one-time GR-SW66464 setup (folders, copy `pipeline_dedup` scripts, seed
+`stage2_done_keys.txt` from `D:\thread_and_text\abc_json`) to run through Jenkins
+instead of a manual RDP session.
+
+### File
+
+| File | Role |
+|------|------|
+| `standalone_scripts/Jenkinsfile.pipeline_bootstrap_state` | Idempotent bootstrap job on `GR-SW66464`. |
+| `standalone_scripts/CONTINUOUS_PIPELINE.md` | Documents Option A (Jenkins) vs Option B (manual). |
+
+### Interaction
+
+Job checks out SCM (or uses `SCRIPT_SOURCE`) → copies `*.py` to
+`D:\thread_and_text\pipeline_scripts` → runs `seed_stage2_done_keys.py` → creates
+empty sibling ledgers under `pipeline_state`. Other continuous jobs then assume
+those paths exist.
+
+## 0. Prior update (2026-07-23) — Continuous Stage-1/Stage-2 Jenkins pipeline (dedup)
+
+### Main goal
+
+Run Stage-1 (filter no Thread/Text STEPs) and Stage-2 (synthetic thread/text on
+remote agents) **in parallel**, without reprocessing keys already filtered,
+distributed, or completed — including the ~3k STEP keys already present as
+~10k JSONs under `D:\thread_and_text\abc_json` on GR-SW66464.
+
+### Architecture
+
+```text
+Stage-1 job (hourly)          Distribute job (~15 min)       Cleanup job (hourly)
+infer + enqueue NEW keys  -->  append STEPs to agents'   --> harvest C:\Threads\jsons
+                               C:\abc_steps_filtered         prune finished STEPs
+                               (NO CLI)                      merge → stage2_done
+
+Central ledgers on GR-SW66464:
+  D:\thread_and_text\pipeline_state\
+    pending_keys.txt / stage1_seen_keys.txt
+    stage2_distributed_keys.txt / stage2_done_keys.txt
+```
+
+### Files added / roles
+
+| File | Role |
+|------|------|
+| `standalone_scripts/CONTINUOUS_PIPELINE.md` | Operator guide for continuous parallel flow. |
+| `standalone_scripts/pipeline_dedup/key_utils.py` | Shared STEP-key parse + ledger IO. |
+| `standalone_scripts/pipeline_dedup/seed_stage2_done_keys.py` | Seed `stage2_done` from `abc_json`. |
+| `standalone_scripts/pipeline_dedup/enqueue_filtered_keys.py` | Allowlist → pending (dedup). |
+| `standalone_scripts/pipeline_dedup/plan_distribute_chunks.py` | Pending → per-node chunks + commit. |
+| `standalone_scripts/pipeline_dedup/append_steps_from_allowlist.py` | Local append-copy helper. |
+| `standalone_scripts/pipeline_dedup/cleanup_agent_filtered.py` | Agent harvest/prune helper. |
+| `standalone_scripts/pipeline_dedup/merge_harvested_done_keys.py` | Merge harvests into done ledger. |
+| `standalone_scripts/Jenkinsfile.pipeline_stage1_enqueue` | Stage-1 infer + enqueue job. |
+| `standalone_scripts/Jenkinsfile.pipeline_distribute_only` | Distribute-only (no CLI, no wipe). |
+| `standalone_scripts/Jenkinsfile.pipeline_cleanup_stage2` | Periodic prune + done-ledger merge. |
+
+### How they interact
+
+1. Seed once: `seed_stage2_done_keys.py` reads `D:\thread_and_text\abc_json` → `stage2_done_keys.txt`.
+2. Stage-1 uses existing `run_onnx_json_batch_inference.py` + `export_step_allowlist_from_inference.py`, then `enqueue_filtered_keys.py` so only keys not in pending/distributed/done enter the queue.
+3. Distribute plans chunks on GR-SW66464, stash/unstash to 10 agents, **append**-copies from each agent's `C:\abc_steps` → `C:\abc_steps_filtered`, then commits keys to `stage2_distributed`.
+4. Local Stage-2 CLI (outside Jenkins) consumes filtered STEPs → `C:\Threads\jsons`.
+5. Cleanup harvests JSON keys per agent, deletes finished STEPs from filtered folders, merges into `stage2_done` and prunes pending/distributed.
+
+### System goals
+
+1. Parallel Stage-1 production and Stage-2 consumption (queue + cron jobs).
+2. Idempotent ledgers so no STEP key is inferred/distributed/synthesized twice.
+3. Jenkins owns distribution + cleanup only; CLI stays off the Jenkins critical path.
+
+## 0. Prior update (2026-07-22) — End-to-end ABC JSON filter pipeline doc
+
+### Main goal
+
+Document the operator pipeline that turns ABC STEPs into filtered (no confident
+Thread/Text) allowlisted STEPs on each Jenkins agent.
+
+### Flow and file interactions
+
+```text
+BatchJsonExport.vba (+ Watchdog-StepOpen.ps1)
+  -> C:\jsons
+  -> delete_duplicate_jsons.py
+  -> check_and_delete_covered_steps.py  (shrink C:\abc_steps_not_in_allowlist)
+  -> run_onnx_json_batch_inference.py --skip-existing
+       Stage-1 CSVs + Stage-2 no_confident_thread_or_text.*
+  -> export_step_allowlist_from_inference.py -> allowed_step_keys.txt
+  -> _gen_filter_jenkinsfile.py -> Jenkinsfile.filter_abc_steps_no_thread_text
+  -> Jenkins: C:\abc_steps -> C:\abc_steps_filtered (per VM)
+```
+
+| File | Role in this pipeline |
+|------|------------------------|
+| `standalone_scripts/END_TO_END_PIPELINE.md` | Full checklist for steps 1–6 above. |
+| `standalone_scripts/WORKFLOW_GUIDE.md` | Smaller task-set CLI details; links to end-to-end doc. |
+| `standalone_scripts/BatchJsonExport.vba` | SolidWorks STEP→JSON export into `C:\jsons`. |
+| `standalone_scripts/run_onnx_json_batch_inference.py` | Lite ONNX + Stage-2 filter. |
+| `standalone_scripts/export_step_allowlist_from_inference.py` | Stage-2 list → STEP-key allowlist. |
+| `standalone_scripts/Jenkinsfile.filter_abc_steps_no_thread_text` | Multi-node copy of allowlisted STEPs. |
+
+### System goals
+
+1. Recover cleanly when VBA export is interrupted (skip list + covered-STEP delete).
+2. Infer only new JSONs; flag parts without confident Thread/Text.
+3. Ship those keys as STEPs into `C:\abc_steps_filtered` via Jenkins.
+
+## 0. Prior update (2026-07-22) — Standalone ops workflow guide
+
+### Main goal
+
+Document the three recurring housekeeping + inference loops operators run from
+`standalone_scripts/`, so the correct script is used for each folder pair and
+safety flag (`DRY_RUN` / `--skip-existing`).
+
+### New / updated files
+
+| File | Role |
+|------|------|
+| `standalone_scripts/WORKFLOW_GUIDE.md` | Task-set instructions derived from script defaults and CLI. |
+| `standalone_scripts/README.md` | Points to the workflow guide. |
+
+### Task-set → script map
+
+| Task | Primary script | Interaction |
+|------|----------------|-------------|
+| 1. Clean duplicate JSONs in `C:\jsons` | `delete_duplicate_jsons.py` | Groups by `..._step_NNN`; keeps first JSON; deletes extras + `*.SLDPRT`. |
+| 2. Delete STEPs already covered by JSONs | `delete_step_files.py` (or `delete_step_files_from_abc_jsons.py` / `check_and_delete_covered_steps.py`) | Matches JSON keys to `.step`/`.stp` in the STEP root; deletes covered STEPs only. |
+| 3. Infer only new JSONs | `run_onnx_json_batch_inference.py --skip-existing` | Skips JSONs that already have `<stem>_predictions.csv` under `<json-dir>/inference/`. |
+
+Optional report helper before deletes: `count_unique_json_vs_steps.py`.
+A1+A3 path remains JSON → `json_to_brepmfr_pyg_optimized.py --inference_profile no_a2` →
+`run_onnx_a1_a3_inference.py` (documented as Option B in the guide).
+
+### System goals these scripts support
+
+1. Keep the JSON export folder free of multi-body duplicates and SolidWorks temps.
+2. Shrink the STEP backlog to only parts still needing JSON export.
+3. Avoid re-running ONNX on JSONs that already have prediction CSVs.
+
+## 0. Prior update (2026-07-22) — `run_onnx_a1_a3_inference.py` inference flow
+
+### Main system goal (this script)
+
+Run the exported A1+A3 / `no_a2` ONNX model on PyG `.pt` graphs and emit per-face
+`Stock` / `Thread` / `Text` predictions (plus optional accuracy metrics when GT exists).
+
+### File role and interactions
+
+| File / artifact | Role |
+|-----------------|------|
+| `standalone_scripts/run_onnx_a1_a3_inference.py` | End-to-end runner: resolve graphs → validate A1+A3 tensors → build 16 ORT inputs → `session.run` → write CSVs/metrics. |
+| `migration_to_c++/migration_to_c/no_a2_72k_epoch50_onnx/brepmfr_a1_a3.onnx` | Default ONNX graph; expects exactly the 16 A1+A3 inputs; single output `probabilities[N,3]`. |
+| `*.pt` under `<dataset>/pyg` (or `--input`) | Stored PyG graphs produced with `--inference_profile no_a2` (must include `spatial_pos` + `edge_path`). |
+| optional `label/<stem>.json` or `graph.label_feature` | Ground truth for metrics columns and aggregate confusion/IoU. |
+| `--output-dir` CSVs | Always written: `<stem>_predictions.csv` + `onnx_inference_summary.csv`. |
+| `--metrics-dir` (default = output-dir) | Written only when GT faces exist: `confusion_matrix.csv`, `per_class.csv`, `summary.md`. |
+
+### Inference path (per graph)
+
+```text
+resolve_graphs (--dataset-path | --input)
+  -> torch.load(.pt)
+  -> ensure_a1_a3_graph (require spatial_pos + edge_path)
+  -> make_a1_a3_batch (16 tensors; spatial_pos+1; edge_path pad/trunc to K=16)
+  -> batch_to_ort_feed (float32 / int64 / bool NumPy)
+  -> onnxruntime.InferenceSession.run -> probabilities[N,3]
+  -> argmax -> predicted_class_id; max -> confidence
+  -> write_predictions CSV; accumulate GT metrics if available
+```
+
+ONNX output is treated as probabilities already (no second softmax). Class map default:
+`0=Stock`, `1=Thread`, `2=Text`.
+
+### Outputs produced
+
+1. **`<stem>_predictions.csv`** — one row per face: `face_index`, `predicted_class_id`,
+   `predicted_label`, `confidence`, `prob_Stock`, `prob_Thread`, `prob_Text`, and when GT
+   exists also `ground_truth_*` + `correct_top1`.
+2. **`onnx_inference_summary.csv`** — one row per graph: path, CSV path, face count,
+   mean confidence, class counts, `has_gt`, PASS/SKIP/FAIL, error text.
+3. **Metrics (GT only)** — face-level confusion matrix, per-class precision/recall/IoU,
+   and `summary.md` with accuracy and mIoU.
+
+## 0. Prior update (2026-07-22) — GrabCAD no_a2 inference and confidence audit
+
+The 28 raw B-rep JSONs under
+`\\Gr-sw66464\d\Demo\grab_cad_brepmfr_testing\jsons` were converted and inferred
+with the A1+A3/no_a2 ONNX package:
+
+```text
+jsons/*.json
+  -> scripts/inference/json_to_brepmfr_pyg_optimized.py --inference_profile no_a2
+  -> pyg_no_a2/pyg/*.pt
+  -> standalone_scripts/run_onnx_a1_a3_inference.py
+  -> migration_to_c++/migration_to_c/exported_a1_a3/brepmfr_a1_a3.onnx
+  -> inference_csvs_no_a2/*_predictions.csv
+```
+
+Files and generated directories involved:
+
+| Item | Role and result |
+|------|-----------------|
+| `scripts/inference/json_to_brepmfr_pyg_optimized.py` | Converted all 28 JSONs to A1+A3 graphs with `spatial_pos` and 16-hop `edge_path`; 28 passed and 0 failed. |
+| `\\Gr-sw66464\d\Demo\grab_cad_brepmfr_testing\pyg_no_a2\pyg` | Reusable intermediate no_a2 graphs, one `.pt` per source JSON. |
+| `standalone_scripts/run_onnx_a1_a3_inference.py` | Wrote face index, predicted class, confidence, and all three class probabilities to each per-part CSV. |
+| `migration_to_c++/migration_to_c/exported_a1_a3/*` | Exact ONNX model, three-class label map (`Stock=0`, `Thread=1`, `Text=2`), and no_a2 model contract used for the run. |
+| `\\Gr-sw66464\d\Demo\grab_cad_brepmfr_testing\inference_csvs_no_a2` | Final output: 28 prediction CSVs, 8,690 face rows, an aggregate `onnx_inference_summary.csv`, and `inference_model_manifest.csv`. |
+
+Full A1+A3 inference passed for 26 graphs. Two assembly instances
+(`grab_cad_4_assembly_final_104` and `_111`) each contain 3,182 faces. The
+exported model attempted a 20,736,253,952-byte A3 gather and exhausted memory.
+Those two were inferred with an A1-only copy of the same ONNX graph by bypassing
+and pruning the A3 bias branch. This matches the training policy more closely
+than full A3 because training skipped A3 above `max_nodes_for_a3=768`. The
+temporary fallback ONNX copies were removed after inference; the manifest marks
+the two affected outputs. Both large graphs predicted all 3,182 faces as Stock.
+
+Aggregate predictions: 7,586 Stock, 220 Thread, and 884 Text. There is no ground
+truth in these JSONs, so these numbers do not measure correctness. Confidence
+does not by itself support a safe "low confidence -> Stock" rule: predicted Text
+has median confidence 0.9901; only 21.15% of Text predictions are below 0.80,
+while 49.77% are below 0.99. If the manually observed stock-as-Text errors are
+among the high-confidence half, thresholding cannot remove them.
+
+Recommended validation path: label a representative real-world calibration set,
+join ground truth to these per-face probabilities, and sweep class-specific
+acceptance thresholds for Thread and Text. Report precision/recall and the
+number of whole parts with zero face errors at every threshold. Add connected
+component/topology and CAD-geometry checks as a second-stage validator, and
+abstain for manual review when a strict guarantee is required. A forced
+three-class prediction cannot guarantee 100% on unseen domain-shifted parts.
+
+## 0. Latest update (2026-07-21) — A1+A3/no_a2 ONNX inference audit
+
+The new fine-tuned model is not compatible with the old seven-input lite inference
+contract. Production inference must use `no_a2` PyG graphs and the A1+A3 ONNX runner:
+
+```text
+raw B-rep JSON
+  -> json_to_brepmfr_pyg_optimized.py --inference_profile no_a2
+  -> PyG graph with base node/edge tensors + spatial_pos (A1) + edge_path (A3)
+  -> run_onnx_a1_a3_inference.py
+  -> brepmfr_a1_a3.onnx (16 inputs; no d2_distance/angle_distance)
+  -> per-face Stock/Thread/Text probabilities and CSVs
+```
+
+Files audited and their interactions:
+
+| File | Role and audit result |
+|------|-----------------------|
+| `standalone_scripts/run_onnx_a1_a3_inference.py` | Correctly rejects lite graphs, creates the 16 required tensors, converts compact stored A1/A3 indices to int64, pads/truncates A3 to 16 hops, and consumes the ONNX model's probability output without applying a second softmax. Its default model and three-class map match the current package. |
+| `migration_to_c++/migration_to_c/no_a2_72k_epoch50_onnx/brepmfr_a1_a3.onnx` | Runtime inspection confirms 16 inputs: five face inputs, six edge inputs, `attn_bias`, `spatial_pos`, `edge_path`, and two masks. Output is `probabilities[total_nodes,3]`. |
+| `migration_to_c++/migration_to_c/no_a2_72k_epoch50_onnx/model_config.json` | Declares `inference_profile=no_a2`, 16-hop A3 paths, spatial cutoff 32, three classes, and the architecture used by the exported checkpoint. |
+| `migration_to_c++/migration_to_c/no_a2_72k_epoch50_onnx/label_map.json` | Confirms `0=Stock`, `1=Thread`, `2=Text`; the mapping is unchanged from the lite three-class model. |
+| `scripts/inference/json_to_brepmfr_pyg_optimized.py` | Must now be called with `--inference_profile no_a2`, not `lite`. It creates `spatial_pos` and `edge_path` and deliberately omits A2 histograms. |
+| `data/collator.py` | Defines the training/PyTorch preprocessing reference. A checked 368-face real graph produced tensors exactly equal to the standalone runner for all 16 inputs. It additionally masks face pairs whose raw distance is at least `spatial_pos_max=32`; the standalone runner currently omits that mask, which can change results for disconnected or long-diameter graphs. |
+| `scripts/threads/train_a1_a3_from_lite.ps1` | Fine-tuning used `max_nodes_for_a3=768`: graphs above 768 faces trained with A1 but without A3. |
+| `migration_to_c++/migration_to_c/export_a1_a3_onnx.py` | Forces `max_nodes_for_a3=None` during export, so the ONNX graph always executes A3. This differs from training for graphs above 768 faces and can consume substantial `O(N² × 16)` memory. A deployment decision is required: constrain inference graph size, preserve the 768-face A3 policy in a compatible export/runner, or deliberately accept full-A3 inference. |
+| `test_a1_a3_onnx_out/*` | Existing real-graph smoke evidence: one 368-face no_a2 graph passed, produced 15 Stock and 353 Text predictions, and matched all available labels. This proves execution, not broad PyTorch-vs-ONNX parity. |
+
+Conclusion: the runner is correct for ordinary connected graphs within the A3 training
+cap, but it is not yet a perfect production-parity implementation for all graph sizes.
+The distance-32 attention mask should be mirrored, and the A3 behavior above 768 faces
+should be made explicit before deployment.
+
+### C++ integration diagnosis: `node_data` rank mismatch
+
+Observed ONNX Runtime error:
+
+```text
+Invalid rank for input: node_data Got: 5 Expected: 4
+```
+
+The ONNX model deliberately uses flattened real nodes for its convolutional face
+encoder. C++ supplied `node_data` as `[1,N,5,5,7]`; the exported contract is
+`[N,5,5,7]`. No re-export is required. The contiguous data buffer is identical, so
+the C++ `Ort::Value::CreateTensor<float>` shape must simply omit the leading batch
+dimension. Only dense graph-structure tensors and masks carry an explicit batch
+dimension:
+
+```text
+node_data         float32 [N,5,5,7]
+face_area         float32 [N]
+face_type         int64   [N]
+face_loop         int64   [N]
+in_degree         int64   [N]
+edge_data         float32 [E,5,7]
+edge_type         int64   [E]
+edge_len          float32 [E]
+edge_ang          float32 [E]
+edge_conv         int64   [E]
+edge_index        int64   [2,E]
+attn_bias         float32 [1,N+1,N+1]
+spatial_pos       int64   [1,N,N]
+edge_path         int64   [1,N,N,16]
+padding_mask      bool    [1,N]
+edge_padding_mask bool    [1,E]
+probabilities     float32 [N,3]
+```
+
 ## 0. Latest update (2026-07-20) — delta raw-JSON sync and clean no_a2 scratch run
 
 New state: `D:\thread_and_text\no_a2\pyg` has ~48k A1+A3 graphs, while `root_json` has ~70k JSONs. The additional ~22k JSONs have raw SolidWorks labels and no lite `.pt`, so the lite-upgrade path cannot process them. The 48k dataset must remain untouched; the expanded corpus is built under `D:\thread_and_text\no_a2_large`.

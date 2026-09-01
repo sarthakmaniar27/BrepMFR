@@ -1,0 +1,154 @@
+// ============================================================================
+// Job: Pipeline-Cleanup-Stage2-Filtered
+// ============================================================================
+// Periodically:
+//   1) On each agent: harvest STEP keys from C:\Threads\jsons
+//   2) Delete matching STEPs from C:\abc_steps_filtered (work finished)
+//   3) On STATE_NODE: merge harvested keys into stage2_done_keys.txt
+//      and prune them from pending + distributed ledgers
+//
+// Suggested cron: H * * * *  (hourly)
+// Does NOT touch the SwOrchestrator CLI.
+// ============================================================================
+
+def NODES = [
+    'WALSWKQA19383',
+    'WALSWKQA19381',
+    'WALSWKQA19380',
+    'WALSWKQA19374',
+    'WALSWKQA19437',
+    'WALSWKQA19438',
+    'WALSWKQA19439',
+    'WALSWKQA19440',
+    'WALSWKQA19441',
+]
+
+def STATE_NODE = 'GR-SW66464'
+def STATE_DIR = 'D:\\thread_and_text\\pipeline_state'
+def SCRIPT_DIR = 'D:\\thread_and_text\\pipeline_scripts'
+def JSON_DIR = 'C:\\Threads\\jsons'
+def FILTERED_DIR = 'C:\\abc_steps_filtered'
+
+pipeline {
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+    }
+
+    parameters {
+        booleanParam(name: 'PRUNE_FILTERED', defaultValue: true,
+                     description: 'Delete STEPs in abc_steps_filtered that already have JSON output')
+        booleanParam(name: 'DRY_RUN', defaultValue: false)
+    }
+
+    stages {
+        stage('1 - Harvest + prune on agents') {
+            steps {
+                script {
+                    def branches = [:]
+                    NODES.each { nodeName ->
+                        branches[nodeName] = {
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE',
+                                       message: "Cleanup failed on ${nodeName}") {
+                                node(nodeName) {
+                                    cleanWs()
+                                    withEnv([
+                                        "TARGET_NODE=${nodeName}",
+                                        "JSON_DIR=${JSON_DIR}",
+                                        "FILTERED_DIR=${FILTERED_DIR}",
+                                        "PRUNE=${params.PRUNE_FILTERED ? '1' : '0'}",
+                                        "DRY=${params.DRY_RUN ? '1' : '0'}",
+                                        "OUT_KEYS=${env.WORKSPACE}\\harvested_${nodeName}.txt",
+                                    ]) {
+                                        powershell '''
+                                        $ErrorActionPreference = 'Stop'
+                                        $jsonDir = $env:JSON_DIR
+                                        $filt = $env:FILTERED_DIR
+                                        $outKeys = $env:OUT_KEYS
+                                        $prune = $env:PRUNE -eq '1'
+                                        $dry = $env:DRY -eq '1'
+
+                                        $keys = New-Object 'System.Collections.Generic.HashSet[string]'
+                                        if (Test-Path $jsonDir) {
+                                            Get-ChildItem -Path $jsonDir -Filter *.json -File -ErrorAction SilentlyContinue | ForEach-Object {
+                                                if ($_.BaseName -match '^(?<key>.+?_step_\\d+)') {
+                                                    [void]$keys.Add($Matches['key'].ToLowerInvariant())
+                                                }
+                                            }
+                                        }
+                                        $sorted = $keys | Sort-Object
+                                        Set-Content -Path $outKeys -Value ($sorted -join "`n") -Encoding UTF8
+                                        Write-Host "Harvested $($keys.Count) keys from $jsonDir"
+
+                                        $deleted = 0
+                                        $remaining = 0
+                                        if (Test-Path $filt) {
+                                            $steps = @(Get-ChildItem -Path $filt -File | Where-Object {
+                                                $_.Extension -match '(?i)\\.(step|stp)$'
+                                            })
+                                            foreach ($s in $steps) {
+                                                $k = $null
+                                                if ($s.BaseName -match '^(?<key>.+?_step_\\d+)') {
+                                                    $k = $Matches['key'].ToLowerInvariant()
+                                                }
+                                                if ($prune -and $k -and $keys.Contains($k)) {
+                                                    if ($dry) {
+                                                        Write-Host "would delete: $($s.Name)"
+                                                    } else {
+                                                        Remove-Item -LiteralPath $s.FullName -Force
+                                                    }
+                                                    $deleted++
+                                                }
+                                            }
+                                            $remaining = @(Get-ChildItem -Path $filt -File -ErrorAction SilentlyContinue | Where-Object {
+                                                $_.Extension -match '(?i)\\.(step|stp)$'
+                                            }).Count
+                                        }
+                                        Write-Host "==== $($env:TARGET_NODE): deleted=$deleted remaining_filtered=$remaining ===="
+                                        '''
+                                    }
+                                    stash name: "harvest_${nodeName}", includes: "harvested_${nodeName}.txt", allowEmpty: true
+                                }
+                            }
+                        }
+                    }
+                    parallel branches
+                }
+            }
+        }
+
+        stage('2 - Merge into central done ledger') {
+            when { expression { return !params.DRY_RUN } }
+            agent { label "${STATE_NODE}" }
+            steps {
+                script {
+                    cleanWs()
+                    dir('harvest') {
+                        NODES.each { n ->
+                            try { unstash "harvest_${n}" } catch (Exception e) {
+                                echo "No harvest stash for ${n}: ${e.message}"
+                            }
+                        }
+                    }
+                    withEnv([
+                        "STATE_DIR=${STATE_DIR}",
+                        "SCRIPT_DIR=${SCRIPT_DIR}",
+                        "HARVEST_DIR=${env.WORKSPACE}\\harvest",
+                    ]) {
+                        powershell '''
+                        $ErrorActionPreference = 'Stop'
+                        $py = Join-Path $env:SCRIPT_DIR 'merge_harvested_done_keys.py'
+                        if (-not (Test-Path $py)) {
+                            throw "Missing $py — copy standalone_scripts/pipeline_dedup to $env:SCRIPT_DIR"
+                        }
+                        python $py --harvest-dir $env:HARVEST_DIR --state-dir $env:STATE_DIR --also-prune-ledgers
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

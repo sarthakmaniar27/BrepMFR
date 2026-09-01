@@ -1,0 +1,2 @@
+graph,prediction_csv,faces,mean_confidence,class_counts,has_gt,status,error
+\\Gr-sw66464\D\Demo\grab_cad_brepmfr_testing\pyg_no_a2\pyg\Klavuz_101.pt,C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\artifacts\klavuz_onnx_comparison\model_c\Klavuz_101_predictions.csv,502,0.96874981,"Stock=150, Thread=255, Text=97",no,PASS,
