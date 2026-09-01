@@ -76,7 +76,10 @@ class _LabelOnlyDataset(Dataset):
         list_path = _resolve_dataset_split_list(path, filelist)
         with open(list_path, "r", encoding="utf-8") as f:
             wanted = set(line.strip() for line in f if line.strip())
-        self.paths = [p for p in path.rglob("*[0-9].pt") if p.stem in wanted]
+        # Keep the same filename contract as split generation and CADSynth:
+        # every split-listed .pt is a graph, even when its stem does not end
+        # in a digit.
+        self.paths = [p for p in path.rglob("*.pt") if p.stem in wanted]
         if not self.paths:
             raise RuntimeError(f"No samples matched '{filelist}' under {path}")
         print(f"[{filelist}] resolved {list_path} -> {len(self.paths):,} files")

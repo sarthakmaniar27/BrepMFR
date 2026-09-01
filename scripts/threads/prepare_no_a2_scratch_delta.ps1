@@ -197,7 +197,7 @@ Write-Host "Step 6/7: recomputing class weights from the new train split..."
 & conda run --no-capture-output -n $CondaEnv python scripts/training/compute_class_weights.py `
     --dataset_path $OutputRoot `
     --split train `
-    --num_classes 3 `
+    --num_classes 5 `
     --alpha 0.5 `
     --num_workers 0 `
     --skip-bad `

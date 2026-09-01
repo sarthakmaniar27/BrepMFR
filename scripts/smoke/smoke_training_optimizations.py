@@ -86,16 +86,21 @@ def check_sdpa_attention() -> None:
         num_heads=4,
         dropout=0.0,
         self_attention=True,
-    ).eval()
+    ).train()
     query = torch.randn(7, 3, 16)
     bias = torch.randn(3, 4, 7, 7) * 0.05
     padding = torch.tensor(
         [[False] * 7, [False] * 5 + [True] * 2, [False] * 6 + [True]]
     )
+    fused, _ = module(
+        query, query, query, bias, key_padding_mask=padding, need_weights=False
+    )
+    # Exercise SplitBackward and parameter gradients; the fused QKV path must
+    # not mutate any of the q/k/v chunk views in-place.
+    fused.square().mean().backward()
+    module.zero_grad(set_to_none=True)
+    module.eval()
     with torch.no_grad():
-        fused, _ = module(
-            query, query, query, bias, key_padding_mask=padding, need_weights=False
-        )
         reference, _ = module(
             query, query, query, bias, key_padding_mask=padding, need_weights=True
         )

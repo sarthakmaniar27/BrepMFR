@@ -165,6 +165,7 @@ class CADSynth(Dataset):
         max_graph_nodes: Optional[int] = None,
         max_nodes_for_a3: Optional[int] = None,
         drop_invalid_graphs: bool = False,
+        require_no_a2_a1_a3: bool = False,
         *,
         # ------------------------------------------------------------------
         # Subgraph training (opt-in; default = False preserves old behavior)
@@ -185,6 +186,7 @@ class CADSynth(Dataset):
         self.max_nodes_for_a3 = max_nodes_for_a3
         self._warned_a3_collate_cap = False
         self.drop_invalid_graphs = bool(drop_invalid_graphs)
+        self.require_no_a2_a1_a3 = bool(require_no_a2_a1_a3)
 
         # Subgraph sampling configuration (ignored when subgraph_training=False)
         self.subgraph_training = bool(subgraph_training)
@@ -263,13 +265,46 @@ class CADSynth(Dataset):
         scan_root = _resolve_graph_pt_scan_root(root_dir, self.pt_subdir)
         if self.pt_subdir:
             print(f"  (--pt_subdir) scanning graphs under: {scan_root}")
-        for x in tqdm(scan_root.rglob(f"*[0-9].pt")):
+        # Split generation and validation accept every .pt stem. Match that
+        # contract here as well instead of silently dropping graph names that
+        # do not end in a digit.
+        for x in tqdm(scan_root.rglob("*.pt")):
             if x.stem in file_list:
                 self.file_paths.append(x)
         print("Done loading {} files".format(len(self.file_paths)))
 
     def load_one_graph(self, file_path):
         pyg_graph = _load_pyg_sample(pathlib.Path(file_path))
+        if self.require_no_a2_a1_a3:
+            has_a1 = bool(
+                getattr(
+                    pyg_graph,
+                    "has_a1",
+                    getattr(pyg_graph, "spatial_pos", None) is not None,
+                )
+            )
+            has_a2 = bool(
+                getattr(
+                    pyg_graph,
+                    "has_a2",
+                    getattr(pyg_graph, "d2_distance", None) is not None
+                    and getattr(pyg_graph, "angle_distance", None) is not None,
+                )
+            )
+            has_a3 = bool(
+                getattr(
+                    pyg_graph,
+                    "has_a3",
+                    getattr(pyg_graph, "edge_path", None) is not None,
+                )
+            )
+            if not has_a1 or has_a2 or not has_a3:
+                raise ValueError(
+                    "Full scratch A1/A3 mode requires "
+                    f"has_a1=True, has_a2=False, has_a3=True; got "
+                    f"has_a1={has_a1}, has_a2={has_a2}, has_a3={has_a3} "
+                    f"for {file_path}"
+                )
         if self.random_rotate:
             rotation = get_random_rotation()
             pyg_graph.node_data = rotate_uvgrid(pyg_graph.node_data, rotation)
@@ -285,10 +320,10 @@ class CADSynth(Dataset):
                 "Remove this stem from train/val/test.txt or fix the source JSON."
             )
         if (lf.max() >= self.num_class) or (lf.min() < 0):
-            print(
-                f"Invalid label in graph id: {getattr(pyg_graph, 'data_id', '?')}, "
+            raise ValueError(
+                f"Invalid label in graph id {getattr(pyg_graph, 'data_id', '?')}: "
                 f"min={lf.min().item()}, max={lf.max().item()}, "
-                f"expected range=[0, {self.num_class - 1}]"
+                f"expected range=[0, {self.num_class - 1}] ({file_path})"
             )
 
         return pyg_graph
@@ -313,7 +348,14 @@ class CADSynth(Dataset):
                 int(idx),
                 self.split,
             )
-            seeds_spec = self.subgraph_seeds_per_class or (2, 3, 3)
+            seeds_spec = self.subgraph_seeds_per_class
+            if seeds_spec is None:
+                # stock/thread/text defaults; extra classes (chamfer/fillet, …) get 2
+                base = [2, 3, 3]
+                if self.num_class <= len(base):
+                    seeds_spec = base[: self.num_class]
+                else:
+                    seeds_spec = base + [2] * (self.num_class - len(base))
             sample = sample_balanced_subgraph(
                 sample,
                 k_hop=self.subgraph_k_hop,

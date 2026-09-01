@@ -1169,6 +1169,27 @@ def build_pyg_from_json_path(
     return pyg
 
 
+def _atomic_torch_save(obj, path: Path) -> None:
+    """Write ``.pt`` to a temp file in the destination directory, then replace.
+
+    Direct ``torch.save`` into the final path can leave a truncated ZIP if a
+    worker is killed mid-write. The lite converter previously skipped any
+    existing ``.pt``, so those truncated files survived into A1/A3 upgrade.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dest_tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    try:
+        torch.save(obj, dest_tmp)
+        os.replace(dest_tmp, path)
+    except BaseException:
+        try:
+            dest_tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def convert_one_json(
     json_path: Path,
     pt_out_dir: Path,
@@ -1275,7 +1296,7 @@ def convert_one_json(
     if profile:
         print_pyg_tensor_sizes(pyg, title=f"{file_stem} | profile={inference_profile}")
     t_save = time.perf_counter()
-    torch.save(pyg, out_pt)
+    _atomic_torch_save(pyg, out_pt)
     if timing is not None:
         timing["torch_save"] = time.perf_counter() - t_save
         timing["total_wall"] = time.perf_counter() - wall0

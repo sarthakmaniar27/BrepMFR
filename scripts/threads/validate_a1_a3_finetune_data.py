@@ -105,7 +105,7 @@ def main() -> int:
     parser.add_argument("--pt-subdir", default="pyg")
     parser.add_argument("--max-files", type=int, default=0, help="0 validates every split-listed graph.")
     parser.add_argument("--report-a3-cap", type=int, default=768)
-    parser.add_argument("--num-classes", type=int, default=3)
+    parser.add_argument("--num-classes", type=int, default=5)
     parser.add_argument(
         "--quarantine-invalid",
         action="store_true",
@@ -161,6 +161,10 @@ def main() -> int:
             labels = getattr(graph, "label_feature", None)
             if labels is None or labels.numel() == 0:
                 raise ValueError("label_feature is missing or empty")
+            if int(labels.numel()) != n:
+                raise ValueError(
+                    f"label_feature has {int(labels.numel())} values for {n} faces"
+                )
             label_min = int(labels.min().item())
             label_max = int(labels.max().item())
             if label_min < 0 or label_max >= int(args.num_classes):

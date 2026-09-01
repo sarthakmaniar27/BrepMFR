@@ -41,10 +41,19 @@ def _dumps(data: dict) -> bytes:
 
 def _labels(data: dict) -> list[int]:
     values: list[int] = []
-    for face in data.get("faces") or []:
-        if not isinstance(face, dict) or "label" not in face:
-            continue
-        values.append(int(face["label"]))
+    for index, face in enumerate(data.get("faces") or []):
+        if not isinstance(face, dict):
+            raise ValueError(f"faces[{index}] is not an object")
+        if "label" not in face:
+            # The converter otherwise defaults a missing face label to Stock
+            # (0), silently poisoning supervised data.
+            raise ValueError(f"faces[{index}] has no label")
+        try:
+            values.append(int(face["label"]))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"faces[{index}].label is not an integer: {face['label']!r}"
+            ) from exc
     return values
 
 
@@ -68,10 +77,17 @@ def _rewrite_one(
         data = _loads(path)
         rewritten = 0
         post = Counter()
-        for face in data.get("faces") or []:
-            if not isinstance(face, dict) or "label" not in face:
-                continue
-            old = int(face["label"])
+        for index, face in enumerate(data.get("faces") or []):
+            if not isinstance(face, dict):
+                raise ValueError(f"faces[{index}] is not an object")
+            if "label" not in face:
+                raise ValueError(f"faces[{index}] has no label")
+            try:
+                old = int(face["label"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"faces[{index}].label is not an integer: {face['label']!r}"
+                ) from exc
             if old not in _WORKER_REMAP:
                 raise ValueError(f"unmapped label {old}")
             new = _WORKER_REMAP[old]

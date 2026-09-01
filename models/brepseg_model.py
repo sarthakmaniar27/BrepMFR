@@ -244,6 +244,20 @@ class BrepSeg(pl.LightningModule):
             1, int(getattr(args, "check_val_every_n_epoch", 1))
         )
         self.fused_adamw = bool(getattr(args, "fused_adamw", False))
+        self.batchnorm_finetune_mode = str(
+            getattr(args, "batchnorm_finetune_mode", "update")
+        )
+        if self.batchnorm_finetune_mode not in {
+            "update",
+            "freeze_stats",
+            "freeze_all",
+        }:
+            raise ValueError(
+                "batchnorm_finetune_mode must be one of "
+                "{'update', 'freeze_stats', 'freeze_all'}, got "
+                f"{self.batchnorm_finetune_mode!r}"
+            )
+        self._frozen_batchnorm_reference = None
 
         # ---------------------------------------------------------
         # Loss function selection
@@ -267,6 +281,14 @@ class BrepSeg(pl.LightningModule):
         # Loss). The LR scheduler monitors per_class_accuracy (macro-averaged)
         # instead of eval_loss to avoid the majority-class-dominated signal.
         self.class_weights_path = getattr(args, "class_weights_path", None)
+        self.reuse_checkpoint_class_weights = bool(
+            getattr(args, "reuse_checkpoint_class_weights", False)
+        )
+        if self.reuse_checkpoint_class_weights and self.class_weights_path:
+            raise ValueError(
+                "Use either reuse_checkpoint_class_weights or "
+                "class_weights_path, not both"
+            )
         if self.class_weights_path and not pathlib.Path(
             self.class_weights_path
         ).expanduser().is_file():
@@ -275,7 +297,14 @@ class BrepSeg(pl.LightningModule):
                 f"using placeholder weights (checkpoint state_dict restores buffers)."
             )
             self.class_weights_path = None
-        if self.class_weights_path:
+        if self.reuse_checkpoint_class_weights:
+            # A placeholder with the correct shape is registered now. The
+            # embedded checkpoint buffer is copied during selective pre-load
+            # and restored again by Lightning's checkpoint loader.
+            weights = torch.ones(self.num_classes, dtype=torch.float32)
+            self.use_class_weights = True
+            print("\nReusing class weights embedded in the checkpoint.")
+        elif self.class_weights_path:
             with open(self.class_weights_path, "r", encoding="utf-8") as f:
                 cw = json.load(f)
             assert cw["num_classes"] == self.num_classes, (
@@ -366,6 +395,25 @@ class BrepSeg(pl.LightningModule):
             print("  missing keys    :", cls_msg.missing_keys)
             print("  unexpected keys :", cls_msg.unexpected_keys)
 
+            if self.reuse_checkpoint_class_weights:
+                embedded_weights = state_dict.get("class_weights")
+                if embedded_weights is None:
+                    raise ValueError(
+                        "reuse_checkpoint_class_weights was requested, but the "
+                        "pretrained checkpoint has no class_weights buffer"
+                    )
+                if embedded_weights.shape != self.class_weights.shape:
+                    raise ValueError(
+                        "Checkpoint class_weights shape mismatch: "
+                        f"{tuple(embedded_weights.shape)} vs "
+                        f"{tuple(self.class_weights.shape)}"
+                    )
+                self.class_weights.copy_(embedded_weights)
+                print(
+                    "Reused checkpoint class weights: "
+                    f"{self.class_weights.detach().cpu().tolist()}"
+                )
+
             # -------------------------
             # 4) Optional encoder freeze
             # -------------------------
@@ -387,6 +435,93 @@ class BrepSeg(pl.LightningModule):
                 f"start_scale={initial_a1_a3_scale:.3f}, "
                 f"ramp_epochs={self.a1_a3_ramp_epochs}"
             )
+        self._configure_batchnorm_finetune()
+
+    def _batchnorm_modules(self):
+        batchnorm_base = nn.modules.batchnorm._BatchNorm
+        return [
+            (name, module)
+            for name, module in self.named_modules()
+            if isinstance(module, batchnorm_base)
+        ]
+
+    def _configure_batchnorm_finetune(self):
+        if self.batchnorm_finetune_mode == "update":
+            return
+        modules = self._batchnorm_modules()
+        frozen_affine_tensors = 0
+        if self.batchnorm_finetune_mode == "freeze_all":
+            for _, module in modules:
+                for parameter in (module.weight, module.bias):
+                    if parameter is not None:
+                        parameter.requires_grad = False
+                        frozen_affine_tensors += 1
+        self._enforce_batchnorm_finetune()
+        print(
+            "\nBatchNorm fine-tune policy: "
+            f"mode={self.batchnorm_finetune_mode}, "
+            f"modules={len(modules)}, "
+            f"frozen_affine_tensors={frozen_affine_tensors}",
+            flush=True,
+        )
+
+    def _enforce_batchnorm_finetune(self):
+        if self.batchnorm_finetune_mode == "update":
+            return
+        # eval() on only the BatchNorm modules preserves their pretrained
+        # running statistics while the rest of the network remains in train
+        # mode (Dropout, Graphormer layers, etc.).
+        for _, module in self._batchnorm_modules():
+            module.eval()
+
+    def _capture_batchnorm_reference(self):
+        if self.batchnorm_finetune_mode == "update":
+            self._frozen_batchnorm_reference = None
+            return
+        reference = {}
+        for name, module in self._batchnorm_modules():
+            if module.running_mean is not None:
+                reference[f"{name}.running_mean"] = (
+                    module.running_mean.detach().cpu().clone()
+                )
+            if module.running_var is not None:
+                reference[f"{name}.running_var"] = (
+                    module.running_var.detach().cpu().clone()
+                )
+            if module.num_batches_tracked is not None:
+                reference[f"{name}.num_batches_tracked"] = (
+                    module.num_batches_tracked.detach().cpu().clone()
+                )
+        self._frozen_batchnorm_reference = reference
+
+    def _assert_batchnorm_reference_unchanged(self):
+        reference = self._frozen_batchnorm_reference
+        if reference is None:
+            return
+        current = dict(self.named_buffers())
+        changed = [
+            name
+            for name, expected in reference.items()
+            if name not in current
+            or not torch.equal(current[name].detach().cpu(), expected)
+        ]
+        if changed:
+            raise RuntimeError(
+                "Frozen BatchNorm running statistics changed during training; "
+                f"first changed buffers: {changed[:10]}"
+            )
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        if mode:
+            self._enforce_batchnorm_finetune()
+        return result
+
+    def on_train_start(self):
+        # This hook runs after Lightning restores an exact-resume checkpoint,
+        # so the reference always reflects the weights actually being trained.
+        self._enforce_batchnorm_finetune()
+        self._capture_batchnorm_reference()
 
     def _a1_a3_scale_for_epoch(self, epoch: int) -> float:
         if self.a1_a3_ramp_epochs <= 0:
@@ -397,14 +532,23 @@ class BrepSeg(pl.LightningModule):
         return self.a1_a3_start_scale + (1.0 - self.a1_a3_start_scale) * progress
 
     def on_load_checkpoint(self, checkpoint):
-        """Allow checkpoints created before the persistent A1/A3 scale buffer."""
+        """Validate compatibility and support older A1/A3 checkpoints."""
         key = "brep_encoder.graph_attn_bias.a1_a3_scale"
         state_dict = checkpoint.get("state_dict", {})
+        if (
+            self.reuse_checkpoint_class_weights
+            and "class_weights" not in state_dict
+        ):
+            raise ValueError(
+                "reuse_checkpoint_class_weights was requested, but the "
+                "checkpoint has no class_weights buffer"
+            )
         if key not in state_dict:
             state_dict[key] = self.brep_encoder.graph_attn_bias.a1_a3_scale.detach().clone()
 
     # Gradually unfreeze encoder after warmup_freeze_epochs
     def on_train_epoch_start(self):
+        self._enforce_batchnorm_finetune()
         a1_a3_scale = self._a1_a3_scale_for_epoch(int(self.current_epoch))
         self.brep_encoder.graph_attn_bias.set_a1_a3_scale(a1_a3_scale)
         self.log(
@@ -472,6 +616,7 @@ class BrepSeg(pl.LightningModule):
         return loss
 
     def on_train_epoch_end(self):
+        self._assert_batchnorm_reference_unchanged()
         opt = self.optimizers()
         if isinstance(opt, (list, tuple)):
             opt = opt[0]
@@ -651,8 +796,14 @@ class BrepSeg(pl.LightningModule):
         self.pred = []
         self.label = []
 
-        # Friendly names for the common 2/3-class thread(+text) setups; else class_i
-        _default_names = {0: "Stock", 1: "Thread", 2: "Text"}
+        # Friendly names for common thread(+text/+chamfer/+fillet) setups; else class_i
+        _default_names = {
+            0: "Stock",
+            1: "Thread",
+            2: "Text",
+            3: "Chamfer",
+            4: "Fillet",
+        }
 
         def _class_name(i: int) -> str:
             return _default_names.get(i, f"class_{i}")
@@ -688,7 +839,7 @@ class BrepSeg(pl.LightningModule):
             self.log(f"test_class_{i}_acc", acc)
             self.log(f"test_class_{i}_precision", precision)
             self.log(f"test_class_{i}_recall", recall)
-            # Named aliases for Stock / Thread / Text when applicable
+            # Named aliases for Stock / Thread / Text / Chamfer / Fillet when applicable
             if i in _default_names:
                 self.log(f"test_{name}_precision", precision)
                 self.log(f"test_{name}_recall", recall)

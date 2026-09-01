@@ -57,6 +57,22 @@ def _load_pt(path: Path):
         return torch.load(path, map_location="cpu")
 
 
+def _free_gb(path: Path) -> float:
+    path.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(path).free / (1024**3)
+
+
+def _cleanup_tmp_saves(out_pyg: Path) -> int:
+    removed = 0
+    for tmp in out_pyg.glob("*.pt.*.tmp"):
+        try:
+            tmp.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _atomic_torch_save(obj, path: Path) -> None:
     """Save via temp-then-replace.  Skips the extra local→network copy when the
     destination is on a local drive (not a UNC path)."""
@@ -73,7 +89,7 @@ def _atomic_torch_save(obj, path: Path) -> None:
         tmp_local = Path(tmp_name)
         dest_tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
         try:
-            torch.save(obj, tmp_local)
+            torch.save(obj, tmp_local, _use_new_zipfile_serialization=False)
             shutil.copyfile(tmp_local, dest_tmp)
             os.replace(dest_tmp, path)
         finally:
@@ -86,7 +102,7 @@ def _atomic_torch_save(obj, path: Path) -> None:
         # Local drive: write temp directly in the target directory (no extra copy).
         dest_tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
         try:
-            torch.save(obj, dest_tmp)
+            torch.save(obj, dest_tmp, _use_new_zipfile_serialization=False)
             os.replace(dest_tmp, path)
         except BaseException:
             try:
@@ -260,6 +276,14 @@ def main() -> int:
         help="Only convert stems listed in train/val/test.txt (default: true).",
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional cap for smoke tests (0 = all).")
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=24.0,
+        help="Abort if the output drive has less free space than this (default: 24). "
+        "A1+A3 graphs are much larger than lite; a full disk makes torch.save "
+        "fail with 'cannot be opened' on the .tmp file.",
+    )
     args = parser.parse_args()
 
     lite_root = args.lite_root.resolve()
@@ -277,8 +301,17 @@ def main() -> int:
     if args.write_labels:
         out_label.mkdir(parents=True, exist_ok=True)
 
+    n_tmp = _cleanup_tmp_saves(out_pyg)
+    free_gb = _free_gb(output_root)
     print(f"lite_root={lite_root}", flush=True)
     print(f"output_root={output_root}", flush=True)
+    print(f"output_free_gb={free_gb:.1f}  removed_tmp={n_tmp}", flush=True)
+    if args.min_free_gb > 0 and free_gb < args.min_free_gb:
+        raise SystemExit(
+            f"Only {free_gb:.1f} GB free on the output drive; need at least "
+            f"{args.min_free_gb:.1f} GB. Point --output-root at a drive with more "
+            f"space (C: is fine; lite can stay on D:), or pass --min-free-gb 0 to override."
+        )
 
     if args.copy_splits:
         for name in ("train.txt", "val.txt", "test.txt"):

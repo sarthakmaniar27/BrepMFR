@@ -51,7 +51,7 @@ import sys
 from datetime import datetime
 
 import torch
-from pytorch_lightning import Trainer
+from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import ModelCheckpoint
 
 from callbacks.training_logging import (
@@ -226,6 +226,26 @@ parser.add_argument(
         "Keep the same --run_name so checkpoints and logs stay in one folder."
     ),
 )
+parser.add_argument(
+    "--full_a1_a3_from_scratch",
+    action="store_true",
+    help=(
+        "Start a new randomly initialized model and require no-A2 graphs with A1/A3. "
+        "This mode rejects --pre_train/--resume_from_checkpoint, forces A1/A3 fully "
+        "active from epoch 0, and disables encoder freezing. Omit this flag to keep "
+        "the legacy initialization behavior."
+    ),
+)
+parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help=(
+        "Optional reproducibility seed for model initialization, data workers, and "
+        "samplers. --full_a1_a3_from_scratch defaults this to 42 when omitted. "
+        "Legacy runs remain unseeded unless this argument is supplied."
+    ),
+)
 
 # parser.add_argument(
 #     "--device",
@@ -243,6 +263,18 @@ parser.add_argument("--dim_node", type=int, default=256)
 parser.add_argument("--n_heads", type=int, default=32)
 parser.add_argument("--n_layers_encode", type=int, default=8)
 parser.add_argument("--warmup_freeze_epochs", type=int, default=3)
+parser.add_argument(
+    "--batchnorm_finetune_mode",
+    choices=("update", "freeze_stats", "freeze_all"),
+    default="update",
+    help=(
+        "BatchNorm behavior during training. 'update' preserves the legacy "
+        "behavior. 'freeze_stats' keeps pretrained running_mean/running_var "
+        "fixed while allowing affine weight/bias updates. 'freeze_all' also "
+        "freezes BatchNorm affine parameters; recommended for controlled "
+        "fine-tuning when the target dataset previously caused BN domain drift."
+    ),
+)
 parser.add_argument(
     "--learning_rate",
     "--learning-rate",
@@ -308,6 +340,16 @@ parser.add_argument(
         "weights. This counteracts the class-0 dominance (~58%% stock) and "
         "produces a less over-confident encoder, which closes the label-shift "
         "gap on target evaluation."
+    ),
+)
+parser.add_argument(
+    "--reuse_checkpoint_class_weights",
+    action="store_true",
+    help=(
+        "For --pre_train/--resume_from_checkpoint, enable weighted loss using "
+        "the class_weights buffer embedded in that checkpoint. This is safer "
+        "for controlled reproduction than a JSON path whose contents may have "
+        "changed. Cannot be combined with --class_weights_path."
     ),
 )
 parser.add_argument(
@@ -564,6 +606,47 @@ def main():
     # guard around training setup, every worker re-imports this module and tries to
     # restart training, eventually crashing in `_check_not_importing_main`.
     args = parser.parse_args()
+    if args.full_a1_a3_from_scratch:
+        if args.traintest != "train":
+            parser.error("--full_a1_a3_from_scratch is valid only with the train command")
+        if args.pre_train or args.resume_from_checkpoint:
+            parser.error(
+                "--full_a1_a3_from_scratch cannot be combined with "
+                "--pre_train or --resume_from_checkpoint"
+            )
+        if args.warmup_freeze_epochs != 0:
+            print(
+                "Scratch A1/A3 mode: overriding --warmup_freeze_epochs to 0.",
+                flush=True,
+            )
+        if args.a1_a3_ramp_epochs != 0:
+            print(
+                "Scratch A1/A3 mode: overriding --a1_a3_ramp_epochs to 0.",
+                flush=True,
+            )
+        args.warmup_freeze_epochs = 0
+        args.a1_a3_ramp_epochs = 0
+        if args.a1_a3_learning_rate is None:
+            args.a1_a3_learning_rate = float(args.learning_rate)
+        if args.seed is None:
+            args.seed = 42
+        args.initialization_mode = "full_a1_a3_from_scratch"
+        print(
+            "Initialization mode: random weights, no checkpoint, "
+            "A1/A3 fully active from epoch 0.",
+            flush=True,
+        )
+    elif args.resume_from_checkpoint:
+        args.initialization_mode = "exact_resume"
+    elif args.pre_train:
+        args.initialization_mode = "pretrained_finetune"
+    else:
+        args.initialization_mode = "legacy_scratch"
+
+    if args.seed is not None:
+        seed_everything(int(args.seed), workers=True)
+        print(f"Reproducibility seed: {int(args.seed)}", flush=True)
+
     if args.allow_tf32 and torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -572,6 +655,12 @@ def main():
     if args.cudnn_benchmark and torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
         print("cuDNN convolution autotuning enabled.", flush=True)
+    if args.fused_adamw:
+        print(
+            "WARNING: fused AdamW requested; disabling Lightning gradient clipping "
+            "because AMP fused optimizers unscale gradients internally.",
+            flush=True,
+        )
     if args.pre_train and args.resume_from_checkpoint:
         parser.error("Use only one of --pre_train (fresh fine-tune state) or --resume_from_checkpoint (exact resume).")
     if args.learning_rate <= 0:
@@ -580,6 +669,27 @@ def main():
         parser.error("--a1_a3_learning_rate must be > 0")
     if args.optimizer_warmup_steps < 0:
         parser.error("--optimizer_warmup_steps must be >= 0")
+    if (
+        args.traintest == "train"
+        and args.batchnorm_finetune_mode != "update"
+        and not (args.pre_train or args.resume_from_checkpoint)
+    ):
+        parser.error(
+            "--batchnorm_finetune_mode freeze_stats/freeze_all requires "
+            "--pre_train or --resume_from_checkpoint; freezing randomly "
+            "initialized BatchNorm statistics is not a valid fine-tune."
+        )
+    if args.reuse_checkpoint_class_weights:
+        if not (args.pre_train or args.resume_from_checkpoint):
+            parser.error(
+                "--reuse_checkpoint_class_weights requires --pre_train or "
+                "--resume_from_checkpoint"
+            )
+        if args.class_weights_path:
+            parser.error(
+                "Use either --reuse_checkpoint_class_weights or "
+                "--class_weights_path, not both"
+            )
     if args.a1_a3_ramp_epochs < 0:
         parser.error("--a1_a3_ramp_epochs must be >= 0")
     if not 0.0 <= args.a1_a3_start_scale <= 1.0:
@@ -638,6 +748,9 @@ def main():
             hyperparam_extras={
                 "dataset_path": args.dataset_path,
                 "class_weights_path": args.class_weights_path,
+                "reuse_checkpoint_class_weights": bool(
+                    args.reuse_checkpoint_class_weights
+                ),
                 "pt_subdir": args.pt_subdir,
                 "checkpoint_dir": str(results_path),
                 "logs_dir": str(logs_path),
@@ -659,6 +772,10 @@ def main():
                 "a1_a3_ramp_epochs": int(args.a1_a3_ramp_epochs),
                 "a1_a3_start_scale": float(args.a1_a3_start_scale),
                 "max_nodes_for_a3": args.max_nodes_for_a3,
+                "batchnorm_finetune_mode": args.batchnorm_finetune_mode,
+                "initialization_mode": args.initialization_mode,
+                "seed": args.seed,
+                "require_no_a2_a1_a3": bool(args.full_a1_a3_from_scratch),
                 "subgraph_training": bool(args.subgraph_training),
                 "subgraph_k_hop": int(args.subgraph_k_hop),
                 "subgraph_seeds_per_class": args.subgraph_seeds_per_class,
@@ -701,7 +818,9 @@ def main():
             logger=loggers,
             accelerator="gpu",
             devices=1,
-            gradient_clip_val=1.0,
+            # Lightning AMP cannot externally unscale/clip gradients for fused
+            # AdamW because that optimizer owns unscaling internally.
+            gradient_clip_val=0.0 if args.fused_adamw else 1.0,
             num_sanity_val_steps=int(args.num_sanity_val_steps),
             accumulate_grad_batches=int(args.accumulate_grad_batches),
             check_val_every_n_epoch=max(1, int(args.check_val_every_n_epoch)),
@@ -734,17 +853,24 @@ Best checkpoint:
 -----------------------------------------------------------------------------------
         """
         )
-        # if args.pre_train is not None:
-        #     model = BrepSeg.load_from_checkpoint(args.pre_train, args=args, strict=False)
-        # else:
-        #     model = BrepSeg(args)
-
-        model = BrepSeg(args)
+        if args.pre_train is not None:
+            pre_path = pathlib.Path(args.pre_train).expanduser().resolve()
+            if not pre_path.is_file():
+                raise FileNotFoundError(f"--pre_train checkpoint not found: {pre_path}")
+            print(f"Loading pre-trained weights from: {pre_path}")
+            model = BrepSeg.load_from_checkpoint(str(pre_path), args=args, strict=False)
+        else:
+            model = BrepSeg(args)
 
         # Stash a back-reference so the model can advance subgraph_epoch each epoch
         # (gives different random crops of the same part across epochs when using
         # --subgraph_training). No effect when subgraph_training is off.
         model._train_dataset_for_subgraph = None
+        dataset_profile_kwargs = {}
+        if args.full_a1_a3_from_scratch:
+            # Omit this newer validation hook for legacy/fine-tune modes so an
+            # older compatible CADSynth constructor continues to work.
+            dataset_profile_kwargs["require_no_a2_a1_a3"] = True
 
         train_data = Dataset(
             root_dir=args.dataset_path,
@@ -761,6 +887,7 @@ Best checkpoint:
             subgraph_seeds_per_class=args.subgraph_seeds_per_class,
             subgraph_on_nontrain=args.subgraph_on_val,  # val controlled separately
             subgraph_global_seed=42,
+            **dataset_profile_kwargs,
         )
         model._train_dataset_for_subgraph = train_data
         val_data = Dataset(
@@ -777,6 +904,7 @@ Best checkpoint:
             subgraph_seeds_per_class=args.subgraph_seeds_per_class,
             subgraph_on_nontrain=args.subgraph_on_val,
             subgraph_global_seed=42,
+            **dataset_profile_kwargs,
         )
         train_loader = train_data.get_dataloader(
             batch_size=args.batch_size,
@@ -822,6 +950,9 @@ Best checkpoint:
             logger=False,
             enable_checkpointing=False,
         )
+        dataset_profile_kwargs = {}
+        if args.full_a1_a3_from_scratch:
+            dataset_profile_kwargs["require_no_a2_a1_a3"] = True
         test_data = Dataset(
             root_dir=args.dataset_path,
             split="test",
@@ -836,6 +967,7 @@ Best checkpoint:
             subgraph_seeds_per_class=args.subgraph_seeds_per_class,
             subgraph_on_nontrain=args.subgraph_on_test,
             subgraph_global_seed=42,
+            **dataset_profile_kwargs,
         )
         test_loader = test_data.get_dataloader(
             batch_size=args.batch_size,

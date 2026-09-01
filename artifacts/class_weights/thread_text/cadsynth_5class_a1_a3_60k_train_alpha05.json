@@ -1,0 +1,26 @@
+{
+  "method": "inv_freq_pow",
+  "alpha": 0.5,
+  "num_classes": 5,
+  "num_samples": 45693,
+  "total_faces": 9344588,
+  "weight_min": 0.1,
+  "weight_max": 20.0,
+  "counts": [
+    3163741,
+    2700567,
+    2903715,
+    90537,
+    486028
+  ],
+  "weights": [
+    0.4314478291253189,
+    0.46698321552125627,
+    0.45035164710484565,
+    2.550443456292914,
+    1.1007738519556647
+  ],
+  "computed_from": "C:\\thread_and_text\\cadsynth_with_fillets_and_champer\\five_class_a1_a3\\no_a2",
+  "split_file": "train.txt",
+  "computed_at": "2026-08-20T10:47:11"
+}

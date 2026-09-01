@@ -151,7 +151,9 @@ class MultiheadAttention(nn.Module):
             q = self.q_proj(query)
             k = self.k_proj(query)
             v = self.v_proj(query)
-        q *= self.scaling
+        # `chunk` returns multiple autograd views; modifying one in-place is
+        # forbidden by SplitBackward. Keep this out-of-place for fused QKV.
+        q = q * self.scaling
 
         q = (
             q.contiguous()
