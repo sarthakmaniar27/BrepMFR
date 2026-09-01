@@ -388,10 +388,17 @@ parser.add_argument(
     "--full_a1_a3_from_scratch",
     action="store_true",
     help=(
+<<<<<<< HEAD
         "On train: randomly initialize and require no-A2 graphs with A1/A3. "
         "On test: only require that same graph contract (A1+A3 present, no A2). "
         "Train mode rejects --pre_train/--resume_from_checkpoint, forces A1/A3 fully "
         "active from epoch 0, and disables encoder freezing."
+=======
+        "Start a new randomly initialized model and require no-A2 graphs with A1/A3. "
+        "This mode rejects --pre_train/--resume_from_checkpoint, forces A1/A3 fully "
+        "active from epoch 0, and disables encoder freezing. Omit this flag to keep "
+        "the legacy initialization behavior."
+>>>>>>> ba9ceddb4df8f2e01d2036bdbff47f1eab4afd2d
     ),
 )
 parser.add_argument(
@@ -764,6 +771,7 @@ def main():
     # guard around training setup, every worker re-imports this module and tries to
     # restart training, eventually crashing in `_check_not_importing_main`.
     args = parser.parse_args()
+<<<<<<< HEAD
     _apply_training_profile(args, parser)
     if args.full_a1_a3_from_scratch:
         if args.traintest == "test":
@@ -800,6 +808,38 @@ def main():
                 "A1/A3 fully active from epoch 0.",
                 flush=True,
             )
+=======
+    if args.full_a1_a3_from_scratch:
+        if args.traintest != "train":
+            parser.error("--full_a1_a3_from_scratch is valid only with the train command")
+        if args.pre_train or args.resume_from_checkpoint:
+            parser.error(
+                "--full_a1_a3_from_scratch cannot be combined with "
+                "--pre_train or --resume_from_checkpoint"
+            )
+        if args.warmup_freeze_epochs != 0:
+            print(
+                "Scratch A1/A3 mode: overriding --warmup_freeze_epochs to 0.",
+                flush=True,
+            )
+        if args.a1_a3_ramp_epochs != 0:
+            print(
+                "Scratch A1/A3 mode: overriding --a1_a3_ramp_epochs to 0.",
+                flush=True,
+            )
+        args.warmup_freeze_epochs = 0
+        args.a1_a3_ramp_epochs = 0
+        if args.a1_a3_learning_rate is None:
+            args.a1_a3_learning_rate = float(args.learning_rate)
+        if args.seed is None:
+            args.seed = 42
+        args.initialization_mode = "full_a1_a3_from_scratch"
+        print(
+            "Initialization mode: random weights, no checkpoint, "
+            "A1/A3 fully active from epoch 0.",
+            flush=True,
+        )
+>>>>>>> ba9ceddb4df8f2e01d2036bdbff47f1eab4afd2d
     elif args.resume_from_checkpoint:
         args.initialization_mode = "exact_resume"
     elif args.pre_train:

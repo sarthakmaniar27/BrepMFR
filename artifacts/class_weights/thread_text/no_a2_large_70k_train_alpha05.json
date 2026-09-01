@@ -1,0 +1,22 @@
+{
+  "method": "inv_freq_pow",
+  "alpha": 0.5,
+  "num_classes": 3,
+  "num_samples": 57760,
+  "total_faces": 11983740,
+  "weight_min": 0.1,
+  "weight_max": 20.0,
+  "counts": [
+    3975409,
+    2938769,
+    5069562
+  ],
+  "weights": [
+    0.9840546562157669,
+    1.1445305882089465,
+    0.8714147555752862
+  ],
+  "computed_from": "D:\\thread_and_text\\no_a2_large",
+  "split_file": "train.txt",
+  "computed_at": "2026-07-20T21:19:50"
+}

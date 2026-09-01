@@ -51,6 +51,7 @@ def _worker_init() -> None:
         pass
 
 
+<<<<<<< HEAD
 def _unlink_with_tmps(path: Path) -> None:
     path.unlink(missing_ok=True)
     parent = path.parent
@@ -61,6 +62,8 @@ def _unlink_with_tmps(path: Path) -> None:
         leftover.unlink(missing_ok=True)
 
 
+=======
+>>>>>>> ba9ceddb4df8f2e01d2036bdbff47f1eab4afd2d
 def _convert_one(job: tuple[str, str, str]) -> tuple[str, str, float]:
     json_path_s, pt_out_dir_s, label_out_dir_s = job
     json_path = Path(json_path_s)
@@ -70,12 +73,22 @@ def _convert_one(job: tuple[str, str, str]) -> tuple[str, str, float]:
     out_label = label_out_dir / f"{json_path.stem}.json"
     started = time.perf_counter()
     try:
+<<<<<<< HEAD
         if out_pt.is_file() and out_label.is_file() and _pt_is_loadable(out_pt):
             return json_path.stem, "skip", time.perf_counter() - started
         # torch.save() over a truncated ZIP throws "unexpected pos". Always
         # start from a clean destination when we are about to rewrite.
         _unlink_with_tmps(out_pt)
         out_label.unlink(missing_ok=True)
+=======
+        if out_pt.is_file() and out_label.is_file():
+            if _pt_is_loadable(out_pt):
+                return json_path.stem, "skip", time.perf_counter() - started
+            # Truncated ZIP from a killed/crashed worker. Remove it so this
+            # stem is converted again instead of poisoning A1/A3 upgrade.
+            out_pt.unlink(missing_ok=True)
+            out_label.unlink(missing_ok=True)
+>>>>>>> ba9ceddb4df8f2e01d2036bdbff47f1eab4afd2d
         convert_one_json(
             json_path,
             pt_out_dir,
@@ -85,8 +98,11 @@ def _convert_one(job: tuple[str, str, str]) -> tuple[str, str, float]:
             max_edge_path_len=16,
             shortest_path_workers=0,
         )
+<<<<<<< HEAD
         if not _pt_is_loadable(out_pt):
             raise RuntimeError(f"wrote unreadable lite graph: {out_pt.name}")
+=======
+>>>>>>> ba9ceddb4df8f2e01d2036bdbff47f1eab4afd2d
         return json_path.stem, "ok", time.perf_counter() - started
     except Exception as exc:
         return json_path.stem, f"fail:{exc}", time.perf_counter() - started

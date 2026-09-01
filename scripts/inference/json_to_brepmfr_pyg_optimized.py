@@ -1180,10 +1180,7 @@ def _atomic_torch_save(obj, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     dest_tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     try:
-        dest_tmp.unlink(missing_ok=True)
-        # ZIP serialization is unreliable for PyG Data on Windows (truncated
-        # central directory → "unexpected pos" on the next torch.load).
-        torch.save(obj, dest_tmp, _use_new_zipfile_serialization=False)
+        torch.save(obj, dest_tmp)
         os.replace(dest_tmp, path)
     except BaseException:
         try:
