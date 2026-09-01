@@ -64,13 +64,21 @@ def _quarantine_invalid(
 ) -> Path:
     quarantine = dataset_root / "quarantine_invalid_graphs"
     quarantine.mkdir(parents=True, exist_ok=True)
+    overwritten = 0
+    skipped_missing = 0
     moved: list[tuple[Path, Path]] = []
     try:
         for stem in sorted(errors):
-            source = graph_paths[stem]
-            destination = quarantine / source.name
+            source = graph_paths.get(stem)
+            destination = quarantine / f"{stem}.pt"
+            if source is None or not source.is_file():
+                skipped_missing += 1
+                continue
+            if source.resolve() == destination.resolve():
+                continue
             if destination.exists():
-                raise FileExistsError(f"Quarantine destination already exists: {destination}")
+                destination.unlink()
+                overwritten += 1
             source.replace(destination)
             moved.append((source, destination))
     except Exception:
@@ -87,6 +95,9 @@ def _quarantine_invalid(
     abc_removed = _rewrite_stem_file(dataset_root / "abc_stems.txt", rejected)
     report = {
         "quarantined_count": len(errors),
+        "moved_count": len(moved),
+        "overwritten_existing_quarantine": overwritten,
+        "already_absent_from_pyg": skipped_missing,
         "split_removals": split_removals,
         "abc_manifest_removals": abc_removed,
         "graphs": [{"stem": stem, "reason": errors[stem]} for stem in sorted(errors)],
@@ -105,7 +116,7 @@ def main() -> int:
     parser.add_argument("--pt-subdir", default="pyg")
     parser.add_argument("--max-files", type=int, default=0, help="0 validates every split-listed graph.")
     parser.add_argument("--report-a3-cap", type=int, default=768)
-    parser.add_argument("--num-classes", type=int, default=3)
+    parser.add_argument("--num-classes", type=int, default=5)
     parser.add_argument(
         "--quarantine-invalid",
         action="store_true",
@@ -161,6 +172,10 @@ def main() -> int:
             labels = getattr(graph, "label_feature", None)
             if labels is None or labels.numel() == 0:
                 raise ValueError("label_feature is missing or empty")
+            if int(labels.numel()) != n:
+                raise ValueError(
+                    f"label_feature has {int(labels.numel())} values for {n} faces"
+                )
             label_min = int(labels.min().item())
             label_max = int(labels.max().item())
             if label_min < 0 or label_max >= int(args.num_classes):
@@ -224,7 +239,8 @@ def main() -> int:
             report_path = _quarantine_invalid(dataset_root, graph_paths, errors)
             print(
                 f"\nQuarantined all {len(errors):,} invalid graphs and removed them from "
-                f"split/ABC lists.\nReport: {report_path}"
+                f"split/ABC lists (existing quarantine copies were replaced).\n"
+                f"Report: {report_path}"
             )
             print("All remaining split-listed graphs passed validation.")
             return 0

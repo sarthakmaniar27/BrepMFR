@@ -603,7 +603,13 @@ class DomainAdapt(pl.LightningModule):
         print("per_face_accuracy_feature: %s" % np.mean(per_face_comp_feature))
 
         # Per-class accuracy / precision / recall (one entry per training class)
-        _default_names = {0: "Stock", 1: "Thread", 2: "Text"}
+        _default_names = {
+            0: "Stock",
+            1: "Thread",
+            2: "Text",
+            3: "Chamfer",
+            4: "Fillet",
+        }
 
         def _class_name(i: int) -> str:
             return _default_names.get(i, f"class_{i}")

@@ -1,0 +1,2 @@
+graph,prediction_csv,faces,mean_confidence,class_counts,has_gt,status,error
+C:\Users\RZA2\Downloads\Klavuz_101\pyg\Klavuz_101.pt,C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\artifacts\klavuz_onnx_comparison\model_d\Klavuz_101_predictions.csv,502,0.96972958,"Stock=404, Text=98",no,PASS,

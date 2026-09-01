@@ -59,13 +59,32 @@ import torch.nn.functional as F
 from models.brepseg_model import BrepSeg, Attention, NonLinearClassifier
 
 # ═══════════════════════════════════════════════════════════════════
-# Label map — 3-class Thread/Text model
+# Label maps — selected from checkpoint num_classes at export time
 # ═══════════════════════════════════════════════════════════════════
-LABEL_MAP = {
+LABEL_MAP_3 = {
     0: "Stock",
     1: "Thread",
     2: "Text",
 }
+LABEL_MAP_5 = {
+    0: "Stock",
+    1: "Thread",
+    2: "Text",
+    3: "Chamfer",
+    4: "Fillet",
+}
+# Default for module-level helpers; main() overwrites from checkpoint.
+LABEL_MAP = dict(LABEL_MAP_3)
+
+
+def resolve_label_map(num_classes: int) -> Dict[int, str]:
+    """Pick the label map that matches the checkpoint head size."""
+    if num_classes == 5:
+        return dict(LABEL_MAP_5)
+    if num_classes == 3:
+        return dict(LABEL_MAP_3)
+    # Fallback: generic names for unexpected head sizes
+    return {i: f"class_{i}" for i in range(num_classes)}
 
 # ═══════════════════════════════════════════════════════════════════
 # 1. ONNX WRAPPER
@@ -714,6 +733,12 @@ def main():
         help="Directory for exported files (default: <script_dir>/exported_a1_a3/)",
     )
     parser.add_argument(
+        "--onnx_name", type=str, default="brepmfr_a1_a3.onnx",
+        help="ONNX filename inside --output_dir (default: brepmfr_a1_a3.onnx). "
+        "Pass brepmfr_lite.onnx when the downstream package expects that name; "
+        "the graph is still the 16-input A1+A3 contract.",
+    )
+    parser.add_argument(
         "--device", type=str, default="cpu",
         choices=["cpu", "cuda"],
         help="Device for PyTorch inference (ONNX RT uses CPU by default)",
@@ -738,7 +763,7 @@ def main():
     else:
         output_dir = _THIS.parent / "exported_a1_a3"
 
-    onnx_path = output_dir / "brepmfr_a1_a3.onnx"
+    onnx_path = output_dir / Path(args.onnx_name).name
 
     # Use cpu for export to avoid CUDA issues during tracing
     export_device = "cpu"
@@ -747,10 +772,16 @@ def main():
     model, model_args = load_brepseg(ckpt_path, device=export_device)
     num_classes = int(getattr(model_args, "num_classes", 3))
 
+    global LABEL_MAP
+    LABEL_MAP = resolve_label_map(num_classes)
+
     # Sanity check: num_classes must match label map
     if num_classes != len(LABEL_MAP):
         print(f"⚠️  WARNING: Checkpoint num_classes={num_classes} but label map has "
               f"{len(LABEL_MAP)} entries. Using num_classes from checkpoint.")
+    else:
+        print(f"  Label map ({num_classes}-class): "
+              f"{', '.join(f'{k}={v}' for k, v in LABEL_MAP.items())}")
 
     # ── Create wrapper ──
     wrapper = BrepMFRONNXWrapper(model)

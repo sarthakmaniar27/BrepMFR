@@ -1,0 +1,164 @@
+﻿Loading checkpoint: model_checkpoints\abc_finetune_forzen_bc\last.ckpt
+
+Using Cross-Entropy Loss
+
+Reusing class weights embedded in the checkpoint.
+
+BatchNorm fine-tune policy: mode=freeze_all, modules=23, frozen_affine_tensors=46
+python.exe : C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\feature_encoders.py:195: 
+TracerWarning: Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data 
+flow of Python values, so this value will be treated as a constant in the future. This means that the trace might not 
+generalize to other inputs!
+At C:\Users\RZA2\AppData\Local\Temp\ps-script-5f0ce48f-9a70-4739-88a1-f0809f7c4a19.ps1:137 char:57
++ ... UTF8 = "1"; & "C:\Users\RZA2\AppData\Local\anaconda3\envs\brep_mfr_py ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\RZA2\D...o other inputs!:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  assert x.size(1) == self.in_channels
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\feature_encoders.py:197: TracerWarning: Converting 
+a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so 
+this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if batch_size == 0:
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\feature_encoders.py:146: TracerWarning: Converting 
+a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so 
+this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  assert x.size(1) == self.in_channels
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\feature_encoders.py:148: TracerWarning: Converting 
+a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python values, so 
+this value will be treated as a constant in the future. This means that the trace might not generalize to other inputs!
+  if batch_size == 0:
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:125: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert embed_dim == self.embed_dim, f"query dim {embed_dim} != {self.embed_dim}"
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:126: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert list(query.size()) == [tgt_len, bsz, embed_dim]
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:130: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert key_bsz == bsz
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:132: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert src_len, bsz == value.shape[:2]
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:177: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert k.size(1) == src_len
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:185: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert key_padding_mask.size(0) == bsz
+C:\Users\RZA2\Desktop\BrepMFR_PyG\BrepMFR_PyG\models\modules\layers\multihead_attention.py:186: TracerWarning: 
+Converting a tensor to a Python boolean might cause the trace to be incorrect. We can't record the data flow of Python 
+values, so this value will be treated as a constant in the future. This means that the trace might not generalize to 
+other inputs!
+  assert key_padding_mask.size(1) == src_len
+C:\Users\RZA2\AppData\Local\anaconda3\envs\brep_mfr_pyg\lib\site-packages\torch\onnx\symbolic_opset9.py:5350: 
+UserWarning: Exporting aten::index operator of advanced indexing in opset 17 is achieved by combination of multiple 
+ONNX operators, including Reshape, Transpose, Concat, and Gather. If indices include negative values, the exported 
+graph will produce incorrect results.
+  warnings.warn(
+  Set A1/A3 scale to 1.0 for inference
+  Model loaded: num_classes=3, dim_node=256, d_model=512, n_heads=32, n_layers=8
+
+============================================================
+STEP 1: PyTorch Sanity Checks
+============================================================
+
+  Testing N=20 faces, E=48 edges...
+    Γ£à Output shape correct: torch.Size([20, 3])
+    Γ£à Probabilities sum to 1.0 (within tolerance)
+    Γ£à No NaN/Inf in output
+    Γä╣∩╕Å  Predicted 1 unique classes: [0] (['Stock'])
+
+  Testing N=50 faces, E=120 edges...
+    Γ£à Output shape correct: torch.Size([50, 3])
+    Γ£à Probabilities sum to 1.0 (within tolerance)
+    Γ£à No NaN/Inf in output
+    Γä╣∩╕Å  Predicted 1 unique classes: [0] (['Stock'])
+
+  Testing N=100 faces, E=250 edges...
+    Γ£à Output shape correct: torch.Size([100, 3])
+    Γ£à Probabilities sum to 1.0 (within tolerance)
+    Γ£à No NaN/Inf in output
+    Γä╣∩╕Å  Predicted 1 unique classes: [0] (['Stock'])
+
+  Testing determinism...
+    Γ£à Deterministic: two runs produce identical output
+
+============================================================
+STEP 2: ONNX Export
+============================================================
+  Exporting with dummy graph: N=50, E=120, K=16
+  ONNX opset version: 17
+  Output: migration_to_c++\migration_to_c\abc_finetune_froze_bn_onnx\brepmfr_a1_a3.onnx
+  Γ£à Export completed in 1.2s
+  Γ£à ONNX model passes onnx.checker validation
+  Γä╣∩╕Å  File size: 20.7 MB
+  Γä╣∩╕Å  IR version: 8
+  Γä╣∩╕Å  Opset: [17]
+  Γä╣∩╕Å  Inputs: ['node_data', 'face_area', 'face_type', 'face_loop', 'in_degree', 'edge_data', 'edge_type', 'edge_len', 'edge_ang', 'edge_conv', 'edge_index', 'attn_bias', 'spatial_pos', 'edge_path', 'padding_mask', 'edge_padding_mask']
+  Γä╣∩╕Å  Outputs: ['probabilities']
+
+============================================================
+STEP 3: ONNX Runtime vs PyTorch Validation
+============================================================
+  ONNX Runtime version: 1.23.2
+  Providers: ['CPUExecutionProvider']
+  Model inputs: ['node_data', 'face_area', 'face_type', 'face_loop', 'in_degree', 'edge_data', 'edge_type', 'edge_len', 'edge_ang', 'edge_conv', 'edge_index', 'attn_bias', 'spatial_pos', 'edge_path', 'padding_mask', 'edge_padding_mask']
+
+  Test 'small': N=20, E=48
+    Γ£à PASS  max_diff=3.43e-09  mean_diff=3.53e-10  labels=20/20
+
+  Test 'medium': N=50, E=120
+    Γ£à PASS  max_diff=1.19e-07  mean_diff=1.60e-09  labels=50/50
+
+  Test 'large': N=100, E=250
+    Γ£à PASS  max_diff=1.19e-07  mean_diff=1.42e-09  labels=100/100
+
+  Test 'xl': N=200, E=500
+    Γ£à PASS  max_diff=1.19e-07  mean_diff=9.10e-10  labels=200/200
+
+  Test 'odd': N=30, E=70
+    Γ£à PASS  max_diff=2.91e-09  mean_diff=3.40e-10  labels=30/30
+
+  Latency comparison (N=50, E=120, 10 runs):
+    PyTorch:      47.7 ms/inference
+    ONNX Runtime: 21.0 ms/inference
+    Speedup:      2.27x
+
+============================================================
+Γ£à ALL CHECKS PASSED ΓÇö A1+A3 ONNX model is ready for C++ deployment
+============================================================
+
+============================================================
+STEP 4: Export Configuration Files
+============================================================
+  Saved: migration_to_c++\migration_to_c\abc_finetune_froze_bn_onnx\model_config.json
+  Saved: migration_to_c++\migration_to_c\abc_finetune_froze_bn_onnx\label_map.json
+
+============================================================
+EXPORT SUMMARY
+============================================================
+  ONNX model:    migration_to_c++\migration_to_c\abc_finetune_froze_bn_onnx\brepmfr_a1_a3.onnx
+  Config:        migration_to_c++\migration_to_c\abc_finetune_froze_bn_onnx\model_config.json
+  Label map:     migration_to_c++\migration_to_c\abc_finetune_froze_bn_onnx\label_map.json
+  Profile:       no_a2 (A1 spatial + A3 edge path, no A2 histograms)
+  Model variant: A1+A3 fine-tuned from lite
+  Num classes:   3
+  Classes:       0=Stock, 1=Thread, 2=Text
+
+  Next steps:
+    1. Copy these files to the C++ project
+    2. Build the C++ tensor converter (Phase 2)
+    3. Integrate with ONNX Runtime C++ API (Phase 3)

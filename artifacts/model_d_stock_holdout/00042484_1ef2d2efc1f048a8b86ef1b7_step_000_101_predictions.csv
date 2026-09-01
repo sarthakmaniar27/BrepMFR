@@ -1,0 +1,4 @@
+face_index,predicted_class_id,predicted_label,confidence,prob_Stock,prob_Thread,prob_Text,ground_truth_class_id,ground_truth_label,correct_top1
+0,0,Stock,0.99999869,0.99999869,0.00000000,0.00000127,0,Stock,1
+1,0,Stock,0.99994147,0.99994147,0.00000017,0.00005836,0,Stock,1
+2,0,Stock,0.99999869,0.99999869,0.00000000,0.00000126,0,Stock,1

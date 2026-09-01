@@ -3,8 +3,11 @@
 """
 Remap SolidWorks-style face ``label`` integers using a JSON map (data-driven).
 
-Typical use: thread + text (3-class) via
-``remap_maps/thread_text_sw_to_brep.json`` (-1/0/-10/70/101 -> 0/1/2).
+Typical use: stock/thread/text/chamfer/fillet (5-class) via
+``remap_maps/thread_text_sw_to_brep.json``
+(-1/0/-10 -> 0, 70 -> 1, 101 -> 2, 15 -> 3, 24 -> 4).
+For folders that may already be partially remapped, use
+``remap_maps/thread_text_sw_to_brep_with_identity.json`` (also maps 1..4 -> themselves).
 
 - ``--dry-run``: print per-label face counts and unknown labels; no writes.
 - ``--yes-write``: apply map and write JSON with indent=2.

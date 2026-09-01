@@ -1,0 +1,4 @@
+class_id,class_name,support_faces,tp,fp,fn,precision,recall,iou
+0,Stock,48796,47665,0,1131,1,0.976822,0.976822
+1,Thread,0,0,6,0,0,,0
+2,Text,0,0,1125,0,0,,0

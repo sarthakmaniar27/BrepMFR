@@ -197,3 +197,21 @@ scripts/sorted_dumps/ours_pairs.csv
 scripts/cadsynth_validation_report_1k.json
 scripts/validation/cadsynth_validation_report_1k.json
 scripts/validation/cadsynth_validation_report.json
+
+# Model checkpoint directory stray files (*.ckpt and *.pt already ignored above)
+model_checkpoints/**/*.tfevents.*
+
+# Generated preview / test output directories
+tensorbaord_results/
+test_a1_a3_onnx_out/
+debug_csv/
+
+# Vim swap files
+*.swp
+
+# Large binary archives
+migration_to_c++.zip
+
+# Large sorted-dump logs and intermediate files
+scripts/sorted_dumps_full/*.log
+scripts/sorted_dumps_full/*.tsv

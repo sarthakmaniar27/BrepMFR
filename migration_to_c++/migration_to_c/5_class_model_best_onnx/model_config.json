@@ -1,0 +1,30 @@
+{
+  "num_classes": 5,
+  "uv_grid_u": 5,
+  "uv_grid_v": 5,
+  "uv_channels": 7,
+  "edge_grid_size": 5,
+  "edge_channels": 7,
+  "max_edge_path_len": 16,
+  "spatial_pos_max": 32,
+  "inference_profile": "no_a2",
+  "model_variant": "a1_a3_finetuned",
+  "training_info": {
+    "base_model": "lite (no A1/A2/A3)",
+    "finetuned_with": "A1 (spatial_pos) + A3 (edge_path)",
+    "a2_status": "excluded (no d2_distance / angle_distance)"
+  },
+  "model_hyperparams": {
+    "dim_node": 256,
+    "d_model": 512,
+    "n_heads": 32,
+    "n_layers_encode": 8,
+    "dropout": 0.3,
+    "attention_dropout": 0.3,
+    "act_dropout": 0.3
+  },
+  "input_dtype_policy": {
+    "float_inputs": "float32",
+    "index_inputs": "int64"
+  }
+}
